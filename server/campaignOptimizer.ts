@@ -15,6 +15,7 @@
 // Nothing happens at Meta without a person's approval, and nothing at all without DATABASE_URL (a
 // change to a live campaign must be recorded and undoable). Needs the token's ads_management.
 import express from 'express';
+import jwt from 'jsonwebtoken';
 import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
 import { aiJson } from './ai.js';
 import { db, ensureTables } from './db.js';
@@ -123,6 +124,38 @@ function creativeKind(c: any) {
   return 'image';
 }
 
+// What the campaign's leads did in the CRM (booked / bought / revenue in ILS, by ad set and ad) -
+// the CRM's POST /api/marketing/campaign-outcomes (server/campaignOutcomes.ts there), same matching
+// as its ROI table. null = no CRM for this business / not reachable (the analysis goes on without it).
+async function crmOutcomes(body: any): Promise<any | null> {
+  const secret = process.env.SSO_SHARED_SECRET;
+  if (!secret) return null;
+  try {
+    const token = jwt.sign({ typ: 'marketing-outcomes', portalTenantId: Number(currentTenant()) }, secret, { expiresIn: '2m' });
+    const r = await fetch(`${process.env.CRM_URL || 'https://crm.smartesek.com'}/api/marketing/campaign-outcomes`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-marketing-token': token },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+    });
+    const d: any = await r.json().catch(() => null);
+    return r.ok && d?.found ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+// ILS for one unit of the ad account's currency (the optics bills in USD), to compare spend with CRM
+// revenue. null when it can't be read.
+async function ilsPerUnit(currency: string): Promise<number | null> {
+  if (!currency || currency === 'ILS') return 1;
+  try {
+    const r = await fetch(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(currency)}&symbols=ILS`, { signal: AbortSignal.timeout(6000) });
+    const d: any = await r.json();
+    return Number(d?.rates?.ILS) || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function readCampaign(creds: Creds, campaignId: string) {
   const { token, accountId } = creds;
   const [account, campaign, adsets, ads, ins7Adset, ins30Adset, ins7Ad, ins30Ad, daily, placements, ageGender, ruleSets] = await Promise.all([
@@ -139,13 +172,26 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     allPages(`${campaignId}/insights`, token, { level: 'campaign', date_preset: 'last_30d', breakdowns: 'age,gender', fields: 'spend,impressions,clicks,actions' }),
     allPages(`${accountId}/value_rule_set`, token, { fields: 'id,name,status' }),
   ]);
+  const allCampaigns = await allPages(`${accountId}/campaigns`, token, { fields: 'id,name' });
+  const currency = account.data?.currency || '';
+  const [crm, ilsRate] = await Promise.all([
+    crmOutcomes({
+      campaignId, campaignName: campaign.data?.name || '',
+      allCampaigns: allCampaigns.rows.map((c: any) => ({ id: String(c.id), name: String(c.name || '') })),
+      adsets: adsets.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
+      ads: ads.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
+    }),
+    ilsPerUnit(currency),
+  ]);
   if (!campaign.ok) throw new Error(metaErr(campaign.data));
   if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) throw new Error('הקמפיין לא שייך לחשבון המודעות של העסק');
   const by = (rows: any[], key: string) => new Map(rows.map(r => [String(r[key]), r]));
   const a7 = by(ins7Adset.rows, 'adset_id'), a30 = by(ins30Adset.rows, 'adset_id');
   const d7 = by(ins7Ad.rows, 'ad_id'), d30 = by(ins30Ad.rows, 'ad_id');
   return {
-    currency: account.data?.currency || '',
+    currency,
+    ilsRate,
+    crm,
     timezone: account.data?.timezone_name || '',
     minDailyBudget: num(account.data?.min_daily_budget),
     campaign: campaign.data,
@@ -164,8 +210,13 @@ type CampaignData = Awaited<ReturnType<typeof readCampaign>>;
 // What the AI sees: compact, amounts in the account's currency (major units).
 function forAi(d: CampaignData) {
   const minor = (v: any) => (v == null || v === '' ? null : round(num(v) / 100));
+  const crm = d.crm;
   return {
     currency: d.currency,
+    ilsPerCurrencyUnit: d.ilsRate,
+    crm: crm
+      ? { note: 'CRM outcomes of this campaign\'s leads, by lead arrival day; revenue in ILS. Purchases come days-weeks after the lead, so the last 7 days are incomplete.', last7: crm.last7, last30: crm.last30, leadsWithUnknownAdset30: crm.unattributedAdset30 }
+      : 'no CRM data for this business',
     campaign: {
       id: d.campaign.id, name: d.campaign.name, status: d.campaign.effective_status, objective: d.campaign.objective,
       bidStrategy: d.campaign.bid_strategy, dailyBudget: minor(d.campaign.daily_budget), lifetimeBudget: minor(d.campaign.lifetime_budget),
@@ -175,11 +226,13 @@ function forAi(d: CampaignData) {
       id: s.id, name: s.name, status: s.effective_status, configuredStatus: s.status, optimizationGoal: s.optimization_goal, bidStrategy: s.bid_strategy,
       dailyBudget: minor(s.daily_budget), learning: s.learning_stage_info?.status || null, valueRuleSet: s.value_rule_set_id || null,
       targeting: targetingSummary(s.targeting), last7: s.m7, last30: s.m30,
+      crm: crm?.byAdset?.[String(s.id)] || null,
     })),
     ads: d.ads.map(a => ({
       id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, configuredStatus: a.status, created: a.created_time,
       kind: creativeKind(a.creative), text: String(a.creative?.body || a.creative?.asset_feed_spec?.bodies?.[0]?.text || '').slice(0, 220),
       last7: a.m7, last30: a.m30,
+      crm: crm?.byAd?.[String(a.id)] || null,
     })),
     last14DaysByDay: d.daily,
     placementsLast30: d.placements,
@@ -190,7 +243,13 @@ function forAi(d: CampaignData) {
 
 const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta (פייסבוק ואינסטגרם) שמתחזק קמפיין קיים של עסק קטן בישראל.
 קיבלת את הגדרות הקמפיין, סטי המודעות והמודעות, והתוצאות שלהם (7 ו-30 יום, 14 ימים אחרונים לפי יום, מיקומים, גיל ומגדר). הסכומים במטבע החשבון.
-המטרה: יותר לידים (או התוצאה שהקמפיין מבצע לה אופטימיזציה) בעלות נמוכה יותר, בלי לשבור מה שעובד.
+המטרה: יותר לקוחות שקובעים תור וקונים, בעלות נמוכה יותר, בלי לשבור מה שעובד.
+
+נתוני ה-CRM (שדה crm - בקמפיין, בכל סט ובכל מודעה): כמה מהלידים קבעו תור (booked), כמה קנו (buyers) וכמה הכניסו (revenue, בשקלים). ההוצאה במטא היא במטבע החשבון; ilsPerCurrencyUnit = כמה שקלים ביחידת מטבע (ROAS = revenue / (spend × ilsPerCurrencyUnit)).
+- כשיש נתוני CRM - הם קובעים יותר מהעלות לליד: סט/מודעה עם לידים יקרים יותר אבל יותר תורים ורכישות עדיף על לידים זולים שלא קובעים.
+- רכישות מגיעות ימים-שבועות אחרי הליד: ב-7 הימים האחרונים הן חלקיות - לשפוט רכישות לפי 30 יום, ותורים גם לפי 7.
+- אם crm חסר בסט/מודעה - ייתכן שהלידים לא שויכו (leadsWithUnknownAdset30); לא להסיק מזה שאין תוצאות.
+- לציין בממצאים את העלות לתור ואת ה-ROAS כשאפשר.
 
 כללים מקצועיים:
 - לא להסיק מסקנות ממעט נתונים: מודעה/סט עם פחות מ-3 לידים או הוצאה נמוכה מפי 2 מהעלות לליד הממוצעת - "אין מספיק נתונים", לא לעצור.
@@ -381,8 +440,10 @@ export function registerOptimizerRoutes(app: express.Express) {
         findings: (Array.isArray(parsed.findings) ? parsed.findings : []).map(String).slice(0, 8),
         currency: data.currency,
         totals: { last7: sumMetrics(data.adsets.map(s => s.m7)), last30: sumMetrics(data.adsets.map(s => s.m30)) },
-        adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30 })),
-        ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30 })),
+        crm: data.crm ? { last7: data.crm.last7, last30: data.crm.last30 } : null,
+        ilsRate: data.ilsRate,
+        adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm?.byAdset?.[String(s.id)] || null })),
+        ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm?.byAd?.[String(a.id)] || null })),
         daily: data.daily,
         readErrors: data.readErrors,
       };

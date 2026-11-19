@@ -10,11 +10,14 @@ type Suggestion = {
   title: string; why: string; expected?: string; risk: 'low' | 'medium' | 'high'; executable: boolean; note?: string;
   before?: any; after?: any;
 };
+type Crm = { leads: number; booked: number; buyers: number; revenue: number };
+type CrmWin = { last7: Crm; last30: Crm } | null;
 type Analysis = {
   summary: string; health: 'good' | 'ok' | 'bad'; findings: string[]; currency: string;
   totals: { last7: any; last30: any };
-  adsets: { id: string; name: string; status: string; learning: string | null; dailyBudget: number | null; m7: M; m30: M }[];
-  ads: { id: string; adsetId: string; name: string; status: string; thumb: string | null; m7: M; m30: M }[];
+  crm?: CrmWin; ilsRate?: number | null;
+  adsets: { id: string; name: string; status: string; learning: string | null; dailyBudget: number | null; m7: M; m30: M; crm?: CrmWin }[];
+  ads: { id: string; adsetId: string; name: string; status: string; thumb: string | null; m7: M; m30: M; crm?: CrmWin }[];
   readErrors?: string[];
 };
 type Change = { id: number; object_name: string; action: string; title: string; before: any; after: any; status: string; error: string | null; done_by: string; done_at: string; undone_at: string | null; undo_of: number | null };
@@ -44,6 +47,20 @@ function describeChange(before: any, after: any, cur: string): string {
   if ('age_min' in after) return `גיל ${before.age_min}–${before.age_max} ← ${after.age_min}–${after.age_max}`;
   if ('value_rule_set_id' in after) return after.value_rule_set_id ? 'הפעלת ערכת כללי ערך' : 'הסרת כללי ערך';
   return '';
+}
+
+// What the leads did in the CRM (30 days by arrival) + ROAS against the spend, in ILS.
+function CrmLine({ crm, spend, rate }: { crm?: CrmWin; spend?: number; rate?: number | null }) {
+  if (!crm) return null;
+  const c = crm.last30;
+  const spendIls = spend != null && rate ? spend * rate : null;
+  const roas = spendIls && spendIls > 0 ? (c.revenue / spendIls).toFixed(1) : null;
+  return (
+    <span className="text-emerald-800">
+      CRM 30 יום: {c.leads} לידים · {c.booked} קבעו תור · {c.buyers} קנו · ₪{Math.round(c.revenue).toLocaleString('he-IL')}
+      {roas ? ` · ROAS ${roas}x` : ''}
+    </span>
+  );
 }
 
 function MetricsCell({ m, cur }: { m: M; cur: string }) {
@@ -156,6 +173,11 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                   </span>
                 </div>
                 <p className="text-sm text-gray-800">{analysis.summary}</p>
+                {analysis.crm ? (
+                  <p className="text-xs bg-emerald-50 rounded-lg px-2 py-1"><CrmLine crm={analysis.crm} spend={analysis.totals.last30.spend} rate={analysis.ilsRate} /></p>
+                ) : (
+                  <p className="text-[11px] text-gray-500">אין נתוני CRM לקמפיין הזה (אין CRM לעסק, או שהלידים לא שויכו לקמפיין) - הניתוח לפי נתוני מטא בלבד.</p>
+                )}
                 {analysis.findings.length > 0 && (
                   <ul className="list-disc pr-5 text-sm text-gray-700 space-y-0.5">{analysis.findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
                 )}
@@ -169,11 +191,13 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                     <div key={s.id} className="bg-gray-50 rounded-lg p-2">
                       <div className="font-bold text-gray-800">{s.name} <span className="font-normal text-gray-500">· {s.status}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${fmt(s.dailyBudget, cur)} ליום` : ''}</span></div>
                       <div className="text-gray-600">7 ימים: <MetricsCell m={s.m7} cur={cur} /> · 30 יום: <MetricsCell m={s.m30} cur={cur} /></div>
+                      {s.crm && <div><CrmLine crm={s.crm} spend={s.m30?.spend} rate={analysis.ilsRate} /></div>}
                       {analysis.ads.filter(a => a.adsetId === s.id).map(a => (
                         <div key={a.id} className="flex items-center gap-2 mt-1 pr-3">
                           {a.thumb && <img src={a.thumb} alt="" className="w-7 h-7 rounded object-cover" loading="lazy" />}
                           <span className="text-gray-700 truncate">{a.name}</span>
                           <span className="text-gray-500 shrink-0">· 7 ימים: <MetricsCell m={a.m7} cur={cur} /></span>
+                          {a.crm && <span className="shrink-0">· <CrmLine crm={a.crm} spend={a.m30?.spend} rate={analysis.ilsRate} /></span>}
                         </div>
                       ))}
                     </div>
