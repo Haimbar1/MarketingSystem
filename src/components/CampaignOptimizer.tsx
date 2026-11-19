@@ -2,8 +2,9 @@
 // suggests changes, the person ticks what to do, confirms, and only then it's executed at Meta.
 // Every change is listed below with "↩ בטל". Server: server/campaignOptimizer.ts.
 import React, { useEffect, useState } from 'react';
-import { X, Loader2, RefreshCw, CheckCircle2, AlertTriangle, Undo2 } from 'lucide-react';
+import { ArrowRight, Loader2, RefreshCw, CheckCircle2, AlertTriangle, Undo2, Pause, Play, Pencil } from 'lucide-react';
 import WeeklyTrend, { Week } from './WeeklyTrend';
+import AudienceView, { Audience } from './AudienceView';
 
 type M = { spend: number; leads: number; cpl: number | null; ctr?: number | null; frequency?: number; impressions?: number } | null;
 type Suggestion = {
@@ -21,8 +22,10 @@ type Analysis = {
   summary: string; health: 'good' | 'ok' | 'bad'; findings: string[]; currency: string;
   totals: { last7: any; last30: any };
   crmPeriods?: CrmPeriod[] | null; ilsRate?: number | null; crmWeeks?: Week[] | null;
-  adsets: { id: string; name: string; status: string; learning: string | null; dailyBudget: number | null; m7: M; m30: M; crm?: CrmWin }[];
-  ads: { id: string; adsetId: string; name: string; status: string; thumb: string | null; m7: M; m30: M; crm?: CrmWin }[];
+  adsets: { id: string; name: string; status: string; configuredStatus?: string; ageMin?: number; ageMax?: number; advantageAudience?: boolean; learning: string | null; dailyBudget: number | null; m7: M; m30: M; crm?: CrmWin }[];
+  ads: { id: string; adsetId: string; name: string; status: string; configuredStatus?: string; thumb: string | null; m7: M; m30: M; crm?: CrmWin }[];
+  campaign?: { id: string; name: string; dailyBudget: number | null; status: string };
+  audience?: Audience;
   readErrors?: string[];
 };
 type Change = { id: number; object_name: string; action: string; title: string; before: any; after: any; status: string; error: string | null; done_by: string; done_at: string; undone_at: string | null; undo_of: number | null };
@@ -182,10 +185,33 @@ function MetricsCell({ m, cur, rate }: { m: M; cur: string; rate?: number | null
   return <span>הוצאה {ils(m.spend, rate, cur)} · {m.leads} לידים · {m.cpl == null ? '—' : ils(m.cpl, rate, cur)} לליד</span>;
 }
 
-export default function CampaignOptimizer({ campaign, onClose }: { campaign: { id: string; name: string }; onClose: () => void }) {
+// One manual change from the ad set / ad rows (Haim, 2026-11-19 - "can I make changes from here, e.g.
+// age?"): the server checks it like an AI suggestion, executes it and logs it (undoable below).
+async function manualChange(campaignId: string, action: string, targetId: string, params: any, title: string) {
+  const d = await fetch(`/api/meta-ads/campaigns/${campaignId}/manual-change`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, targetId, params, title }),
+  }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+  return d as { success: boolean; error?: string; note?: string };
+}
+
+function EditBox({ label, children, onSave, onCancel, busy }: { label: string; children: React.ReactNode; onSave: () => void; onCancel: () => void; busy: boolean }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 bg-white border border-blue-200 rounded-lg p-2 mt-1">
+      <span className="font-bold text-gray-700">{label}</span>
+      {children}
+      <button onClick={onSave} disabled={busy} className="bg-blue-600 text-white font-bold rounded px-2 py-1 disabled:opacity-50">{busy ? 'מבצע…' : 'לבצע'}</button>
+      <button onClick={onCancel} disabled={busy} className="border border-gray-300 rounded px-2 py-1">ביטול</button>
+    </div>
+  );
+}
+
+const fmtWhen = (iso: string) => new Date(iso).toLocaleString('he-IL', { weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id: string; name: string }; onBack: () => void }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [optId, setOptId] = useState<number | null>(null);
+  const [asOf, setAsOf] = useState<string | null>(null); // when the shown analysis was made
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [canExecute, setCanExecute] = useState(false);
@@ -196,13 +222,27 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
   const [results, setResults] = useState<Record<string, { ok: boolean; error?: string }>>({});
   const [changes, setChanges] = useState<Change[]>([]);
   const [undoing, setUndoing] = useState<number | null>(null);
+  const [edit, setEdit] = useState<{ kind: 'age' | 'budget' | 'cbudget'; id: string } | null>(null);
+  const [editVals, setEditVals] = useState<{ min?: string; max?: string; ils?: string }>({});
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
 
   const cur = analysis?.currency || '';
+  const rate = analysis?.ilsRate || null;
+  const stale = !!asOf && Date.now() - new Date(asOf).getTime() > 24 * 3600_000;
+
+  const show = (d: any, when: string) => {
+    RATE = d.analysis?.ilsRate || null;
+    setOptId(d.optimizationId); setAnalysis(d.analysis); setSuggestions(d.suggestions || []); setAsOf(when);
+    const b: Record<string, string> = {};
+    (d.suggestions || []).forEach((s: Suggestion) => { if (s.params?.dailyBudget != null) b[s.id] = String(s.params.dailyBudget); });
+    setBudgets(b);
+  };
 
   const loadChanges = async () => {
     try {
       const d = await fetch(`/api/meta-ads/campaigns/${campaign.id}/changes`).then(r => r.json());
-      if (d?.success) setChanges(d.changes || []);
+      if (d?.success) { setChanges(d.changes || []); setCanExecute(!d.noDatabase); }
     } catch { /* the list is secondary */ }
   };
 
@@ -211,11 +251,8 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
     try {
       const d = await fetch(`/api/meta-ads/campaigns/${campaign.id}/analyze`, { method: 'POST' }).then(r => r.json());
       if (!d?.success) { setError(d?.error || 'הניתוח נכשל'); return; }
-      RATE = d.analysis?.ilsRate || null;
-      setOptId(d.optimizationId); setAnalysis(d.analysis); setSuggestions(d.suggestions || []); setCanExecute(!!d.canExecute);
-      const b: Record<string, string> = {};
-      (d.suggestions || []).forEach((s: Suggestion) => { if (s.params?.dailyBudget != null) b[s.id] = String(s.params.dailyBudget); });
-      setBudgets(b);
+      show(d, new Date().toISOString());
+      setCanExecute(!!d.canExecute);
     } catch (e: any) {
       setError(e?.message || 'שגיאת רשת');
     } finally {
@@ -223,7 +260,18 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
     }
   };
 
-  useEffect(() => { analyze(); loadChanges(); }, [campaign.id]);
+  // the last stored analysis; a new one only when there's none (or 🔄)
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const d = await fetch(`/api/meta-ads/campaigns/${campaign.id}/latest`).then(r => r.json());
+        if (d?.latest?.analysis?.summary != null) { show(d.latest, d.latest.createdAt); setLoading(false); }
+        else await analyze();
+      } catch { await analyze(); }
+    })();
+    loadChanges();
+  }, [campaign.id]);
 
   const chosen = suggestions.filter(s => s.executable && picked[s.id]);
 
@@ -257,157 +305,226 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
     }
   };
 
+  // a manual change, after a confirm; the shown values are patched on success
+  const doManual = async (action: string, targetId: string, params: any, title: string, confirmText: string, patch?: () => void) => {
+    if (!window.confirm(`${confirmText}\n\nהשינוי יבוצע עכשיו בקמפיין החי (אפשר לבטל אותו אחר כך).`)) return;
+    setBusy(true); setNotice(null);
+    const d = await manualChange(campaign.id, action, targetId, params, title);
+    setBusy(false);
+    if (d.success) { patch?.(); setEdit(null); setNotice({ ok: true, text: `✓ בוצע: ${title}${d.note ? ` (${d.note})` : ''}` }); loadChanges(); }
+    else setNotice({ ok: false, text: d.error || 'השינוי נכשל' });
+  };
+  const patchAdset = (id: string, p: any) => setAnalysis(a => (a ? { ...a, adsets: a.adsets.map(s => (s.id === id ? { ...s, ...p } : s)) } : a));
+  const patchAd = (id: string, p: any) => setAnalysis(a => (a ? { ...a, ads: a.ads.map(x => (x.id === id ? { ...x, ...p } : x)) } : a));
+  const ilsToCur = (ils: number) => (cur === 'ILS' || !rate ? ils : Math.round((ils / rate) * 100) / 100);
+  const curToIls = (v: number | null) => (v == null ? null : cur === 'ILS' || !rate ? v : Math.round(v * rate));
+  const btn = 'inline-flex items-center gap-1 border border-gray-300 rounded-lg px-2 py-0.5 hover:bg-white disabled:opacity-50';
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-2 sm:p-4" onClick={onClose} dir="rtl">
-      <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[94vh] flex flex-col" onClick={e => e.stopPropagation()}>
-        <div className="flex items-start justify-between gap-2 p-4 border-b border-gray-100">
-          <div className="min-w-0">
-            <h3 className="font-bold text-gray-800">🔧 ניתוח והצעות לשיפור</h3>
-            <p className="text-xs text-gray-500 truncate">{campaign.name} · שום דבר לא משתנה במטא בלי האישור שלך</p>
-          </div>
-          <div className="flex items-center gap-1 shrink-0">
-            <button onClick={analyze} disabled={loading} title="נתח שוב" className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 disabled:opacity-50">
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-            </button>
-            <button onClick={onClose} className="p-2 rounded-lg hover:bg-gray-100 text-gray-600"><X className="w-4 h-4" /></button>
-          </div>
+    <div dir="rtl" className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <button onClick={onBack} className="inline-flex items-center gap-1 text-sm text-gray-700 hover:text-gray-900"><ArrowRight className="w-4 h-4" /> כל הקמפיינים</button>
+        <div className="flex items-center gap-2 text-xs text-gray-500">
+          {asOf && !loading && <span>נכון ל{fmtWhen(asOf)}</span>}
+          <button onClick={analyze} disabled={loading} className="inline-flex items-center gap-1 border border-gray-300 rounded-lg px-2 py-1 text-gray-700 hover:bg-white disabled:opacity-50">
+            {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} רענן ניתוח
+          </button>
         </div>
+      </div>
 
-        <div className="p-4 overflow-y-auto space-y-4">
-          {loading && <p className="text-sm text-gray-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> קורא את הקמפיין מ-Meta ומנתח… (עד דקה)</p>}
-          {error && <p className="text-sm text-red-700 bg-red-50 rounded-lg p-3">{error}</p>}
+      <div className="bg-white rounded-xl border border-gray-200 p-4 space-y-4">
+        <div>
+          <h3 className="font-bold text-gray-800">🔧 {campaign.name}</h3>
+          <p className="text-xs text-gray-500">ניתוח והצעות לשיפור · שום דבר לא משתנה במטא בלי האישור שלך</p>
+        </div>
+        {loading && <p className="text-sm text-gray-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> קורא את הקמפיין מ-Meta ומנתח… (עד דקה)</p>}
+        {error && <p className="text-sm text-red-700 bg-red-50 rounded-lg p-3">{error}</p>}
+        {notice && <p className={`text-xs rounded-lg p-2 ${notice.ok ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'}`}>{notice.text}</p>}
 
-          {analysis && !loading && (
-            <>
-              <div className="space-y-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-xs font-bold px-2 py-0.5 rounded ${HEALTH[analysis.health]?.[1]}`}>{HEALTH[analysis.health]?.[0]}</span>
+        {analysis && !loading && (
+          <>
+            <div className="space-y-2">
+              <span className={`inline-block text-xs font-bold px-2 py-0.5 rounded ${HEALTH[analysis.health]?.[1]}`}>{HEALTH[analysis.health]?.[0]}</span>
+              <p className="text-sm text-gray-800">{analysis.summary}</p>
+              <SummaryTable a={analysis} />
+              {!analysis.crmPeriods && (
+                <p className="text-[11px] text-gray-500">אין נתוני CRM לקמפיין הזה (אין CRM לעסק) - הניתוח לפי נתוני מטא בלבד.</p>
+              )}
+              {analysis.findings.length > 0 && (
+                <ul className="list-disc pr-5 text-sm text-gray-700 space-y-0.5">{analysis.findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
+              )}
+              {analysis.readErrors?.length ? <p className="text-[11px] text-amber-700">חלק מהנתונים לא נקראו: {analysis.readErrors.join(' · ')}</p> : null}
+            </div>
 
-                </div>
-                <p className="text-sm text-gray-800">{analysis.summary}</p>
-                <SummaryTable a={analysis} />
-                {analysis.crmWeeks?.length ? <WeeklyTrend weeks={analysis.crmWeeks} /> : null}
-                {!analysis.crmPeriods && (
-                  <p className="text-[11px] text-gray-500">אין נתוני CRM לקמפיין הזה (אין CRM לעסק, או שהלידים לא שויכו לקמפיין) - הניתוח לפי נתוני מטא בלבד.</p>
-                )}
-                {analysis.findings.length > 0 && (
-                  <ul className="list-disc pr-5 text-sm text-gray-700 space-y-0.5">{analysis.findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
-                )}
-                {analysis.readErrors?.length ? <p className="text-[11px] text-amber-700">חלק מהנתונים לא נקראו: {analysis.readErrors.join(' · ')}</p> : null}
-              </div>
+            {analysis.crmWeeks?.length ? <WeeklyTrend weeks={analysis.crmWeeks} /> : null}
+            {analysis.audience ? <AudienceView audience={analysis.audience} currency={cur} rate={rate} /> : <p className="text-[11px] text-gray-500">גיל, מגדר ומיקום יופיעו אחרי "רענן ניתוח".</p>}
 
-              <details className="text-xs">
-                <summary className="cursor-pointer text-gray-600 font-bold">הנתונים לפי סט ומודעה</summary>
-                <div className="mt-2 space-y-2">
-                  {analysis.adsets.map(s => (
-                    <div key={s.id} className="bg-gray-50 rounded-lg p-2">
-                      <div className="font-bold text-gray-800">{s.name} <span className="font-normal text-gray-500">· {statusHe(s.status)}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}</span></div>
-                      <div className="text-gray-600">7 ימים אחרונים: <MetricsCell m={s.m7} cur={cur} rate={analysis.ilsRate} /> · 30 ימים אחרונים: <MetricsCell m={s.m30} cur={cur} rate={analysis.ilsRate} /></div>
-                      {s.crm && <div><CrmLine crm={s.crm} periods={analysis.crmPeriods} /></div>}
-                      {analysis.ads.filter(a => a.adsetId === s.id).map(a => (
-                        <div key={a.id} className="flex items-center gap-2 mt-1 pr-3">
-                          {a.thumb && <img src={a.thumb} alt="" className="w-7 h-7 rounded object-cover" loading="lazy" />}
-                          <span className="text-gray-700 truncate">{a.name}</span>
-                          <span className="text-gray-500 shrink-0">· 7 ימים אחרונים: <MetricsCell m={a.m7} cur={cur} rate={analysis.ilsRate} /></span>
-                          {a.crm && <span className="shrink-0">· <CrmLine crm={a.crm} periods={analysis.crmPeriods} /></span>}
+            {/* the suggestions */}
+            <div className="space-y-2">
+              <h4 className="font-bold text-sm text-gray-800">ההצעות ({suggestions.length})</h4>
+              {stale && suggestions.some(s => s.executable) && (
+                <p className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2">הניתוח מלפני יותר מיום - כדי לבצע הצעות, לחצו "רענן ניתוח" (שינויים ידניים בסטים למטה אפשר לעשות תמיד).</p>
+              )}
+              {suggestions.length === 0 && <p className="text-sm text-gray-500">אין הצעות לשינוי כרגע.</p>}
+              {suggestions.map(s => {
+                const res = results[s.id];
+                return (
+                  <label key={s.id} className={`block border rounded-xl p-3 ${picked[s.id] ? 'border-blue-400 bg-blue-50/40' : 'border-gray-200'} ${s.executable ? 'cursor-pointer' : ''}`}>
+                    <div className="flex items-start gap-2">
+                      {s.executable && canExecute && !stale && !res?.ok ? (
+                        <input type="checkbox" className="mt-1" checked={!!picked[s.id]} onChange={e => setPicked(p => ({ ...p, [s.id]: e.target.checked }))} />
+                      ) : <span className="w-4" />}
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-bold text-sm text-gray-800">{s.title}</span>
+                          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-gray-100 text-gray-700">{ACTION_HE[s.action] || s.action}</span>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${RISK[s.risk]?.[1]}`}>{RISK[s.risk]?.[0]}</span>
                         </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              </details>
-
-              <div className="space-y-2">
-                <h4 className="font-bold text-sm text-gray-800">ההצעות ({suggestions.length})</h4>
-                {suggestions.length === 0 && <p className="text-sm text-gray-500">אין הצעות לשינוי כרגע.</p>}
-                {suggestions.map(s => {
-                  const res = results[s.id];
-                  return (
-                    <label key={s.id} className={`block border rounded-xl p-3 ${picked[s.id] ? 'border-blue-400 bg-blue-50/40' : 'border-gray-200'} ${s.executable ? 'cursor-pointer' : ''}`}>
-                      <div className="flex items-start gap-2">
-                        {s.executable && canExecute && !res?.ok ? (
-                          <input type="checkbox" className="mt-1" checked={!!picked[s.id]} onChange={e => setPicked(p => ({ ...p, [s.id]: e.target.checked }))} />
-                        ) : <span className="w-4" />}
-                        <div className="min-w-0 flex-1 space-y-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-bold text-sm text-gray-800">{s.title}</span>
-                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-gray-100 text-gray-700">{ACTION_HE[s.action] || s.action}</span>
-                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${RISK[s.risk]?.[1]}`}>{RISK[s.risk]?.[0]}</span>
+                        {s.targetName && <p className="text-xs text-gray-600">על: {s.targetName}{s.executable ? ` · ${describeChange(s.before, s.after, cur)}` : ''}</p>}
+                        <p className="text-xs text-gray-700">{s.why}</p>
+                        {s.expected && <p className="text-xs text-gray-500">צפוי: {s.expected}</p>}
+                        {s.note && <p className="text-[11px] text-amber-700">{s.note}</p>}
+                        {s.executable && s.params?.dailyBudget != null && picked[s.id] && (
+                          <div className="flex items-center gap-2 text-xs" onClick={e => e.preventDefault()}>
+                            <span>תקציב יומי חדש:</span>
+                            <input type="number" min={0} step="0.5" value={budgets[s.id] ?? ''} onChange={e => setBudgets(b => ({ ...b, [s.id]: e.target.value }))}
+                              className="w-24 border border-gray-300 rounded px-2 py-1" />
+                            <span>{curName(cur)}{cur !== 'ILS' && rate && budgets[s.id] ? ` (≈₪${Math.round(Number(budgets[s.id]) * rate).toLocaleString('he-IL')})` : ''}</span>
                           </div>
-                          {s.targetName && <p className="text-xs text-gray-600">על: {s.targetName}{s.executable ? ` · ${describeChange(s.before, s.after, cur)}` : ''}</p>}
-                          <p className="text-xs text-gray-700">{s.why}</p>
-                          {s.expected && <p className="text-xs text-gray-500">צפוי: {s.expected}</p>}
-                          {s.note && <p className="text-[11px] text-amber-700">{s.note}</p>}
-                          {s.executable && s.params?.dailyBudget != null && picked[s.id] && (
-                            <div className="flex items-center gap-2 text-xs" onClick={e => e.preventDefault()}>
-                              <span>תקציב יומי חדש:</span>
-                              <input type="number" min={0} step="0.5" value={budgets[s.id] ?? ''} onChange={e => setBudgets(b => ({ ...b, [s.id]: e.target.value }))}
-                                className="w-24 border border-gray-300 rounded px-2 py-1" />
-                              <span>{curName(cur)}{cur !== 'ILS' && analysis.ilsRate && budgets[s.id] ? ` (≈₪${Math.round(Number(budgets[s.id]) * analysis.ilsRate).toLocaleString('he-IL')})` : ''}</span>
-                            </div>
-                          )}
-                          {res && (
-                            <p className={`text-xs font-bold flex items-center gap-1 ${res.ok ? 'text-green-700' : 'text-red-700'}`}>
-                              {res.ok ? <><CheckCircle2 className="w-3.5 h-3.5" /> בוצע במטא</> : <><AlertTriangle className="w-3.5 h-3.5" /> {res.error}</>}
-                            </p>
-                          )}
-                        </div>
+                        )}
+                        {res && (
+                          <p className={`text-xs font-bold flex items-center gap-1 ${res.ok ? 'text-green-700' : 'text-red-700'}`}>
+                            {res.ok ? <><CheckCircle2 className="w-3.5 h-3.5" /> בוצע במטא</> : <><AlertTriangle className="w-3.5 h-3.5" /> {res.error}</>}
+                          </p>
+                        )}
                       </div>
-                    </label>
-                  );
-                })}
-                {!canExecute && suggestions.some(s => s.executable) && (
-                  <p className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2">כדי לבצע שינויים מכאן צריך מסד נתונים (DATABASE_URL ב-Vercel של מערכת השיווק) - כל שינוי נשמר עם אפשרות ביטול.</p>
-                )}
-              </div>
-
-              {canExecute && chosen.length > 0 && !confirming && (
-                <button onClick={() => setConfirming(true)} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl py-2.5">
-                  ✅ לאשר ולבצע {chosen.length} שינויים
-                </button>
-              )}
-              {confirming && (
-                <div className="border-2 border-blue-400 rounded-xl p-3 space-y-2 bg-blue-50">
-                  <p className="font-bold text-sm text-gray-800">לבצע עכשיו בקמפיין החי?</p>
-                  <ul className="text-xs text-gray-700 list-disc pr-5 space-y-0.5">
-                    {chosen.map(s => (
-                      <li key={s.id}>{s.title} - {s.targetName}{s.params?.dailyBudget != null ? ` (${withIls(Number(budgets[s.id]), cur)} ליום)` : ` (${describeChange(s.before, s.after, cur)})`}</li>
-                    ))}
-                  </ul>
-                  <div className="flex gap-2">
-                    <button onClick={execute} disabled={executing} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg py-2 disabled:opacity-60">
-                      {executing ? 'מבצע…' : 'כן, לבצע'}
-                    </button>
-                    <button onClick={() => setConfirming(false)} disabled={executing} className="flex-1 bg-white border border-gray-300 rounded-lg py-2 font-bold text-gray-700">ביטול</button>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          {changes.length > 0 && (
-            <div className="space-y-1.5 pt-2 border-t border-gray-100">
-              <h4 className="font-bold text-sm text-gray-800">שינויים שבוצעו בקמפיין</h4>
-              {changes.map(c => (
-                <div key={c.id} className="flex items-start gap-2 text-xs bg-gray-50 rounded-lg p-2">
-                  <div className="min-w-0 flex-1">
-                    <div className="font-bold text-gray-800">{c.title} <span className="font-normal text-gray-500">· {c.object_name}</span></div>
-                    <div className="text-gray-600">
-                      {describeChange(c.before, c.after, cur)} · {new Date(c.done_at).toLocaleString('he-IL')} · {c.done_by}
-                      {c.status === 'failed' && <span className="text-red-700"> · נכשל: {c.error}</span>}
-                      {c.undone_at && <span className="text-gray-500"> · בוטל</span>}
                     </div>
-                  </div>
-                  {c.status === 'done' && !c.undone_at && !c.undo_of && (
-                    <button onClick={() => undo(c)} disabled={undoing === c.id} className="shrink-0 flex items-center gap-1 text-gray-700 border border-gray-300 rounded-lg px-2 py-1 hover:bg-white disabled:opacity-50">
-                      <Undo2 className="w-3.5 h-3.5" /> בטל
-                    </button>
+                  </label>
+                );
+              })}
+              {!canExecute && suggestions.some(s => s.executable) && (
+                <p className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2">כדי לבצע שינויים מכאן צריך מסד נתונים (DATABASE_URL ב-Vercel של מערכת השיווק).</p>
+              )}
+            </div>
+
+            {canExecute && chosen.length > 0 && !confirming && (
+              <button onClick={() => setConfirming(true)} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl py-2.5">
+                ✅ לאשר ולבצע {chosen.length} שינויים
+              </button>
+            )}
+            {confirming && (
+              <div className="border-2 border-blue-400 rounded-xl p-3 space-y-2 bg-blue-50">
+                <p className="font-bold text-sm text-gray-800">לבצע עכשיו בקמפיין החי?</p>
+                <ul className="text-xs text-gray-700 list-disc pr-5 space-y-0.5">
+                  {chosen.map(s => (
+                    <li key={s.id}>{s.title} - {s.targetName}{s.params?.dailyBudget != null ? ` (${withIls(Number(budgets[s.id]), cur)} ליום)` : ` (${describeChange(s.before, s.after, cur)})`}</li>
+                  ))}
+                </ul>
+                <div className="flex gap-2">
+                  <button onClick={execute} disabled={executing} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg py-2 disabled:opacity-60">
+                    {executing ? 'מבצע…' : 'כן, לבצע'}
+                  </button>
+                  <button onClick={() => setConfirming(false)} disabled={executing} className="flex-1 bg-white border border-gray-300 rounded-lg py-2 font-bold text-gray-700">ביטול</button>
+                </div>
+              </div>
+            )}
+
+            {/* ad sets and ads, with manual changes */}
+            <div className="space-y-2 text-xs">
+              <h4 className="font-bold text-sm text-gray-800">סטים ומודעות - שינוי ידני</h4>
+              {analysis.campaign?.dailyBudget != null && canExecute && (
+                <div className="bg-gray-50 rounded-lg p-2">
+                  <span className="font-bold text-gray-800">תקציב הקמפיין (CBO): </span>{withIls(analysis.campaign.dailyBudget, cur)} ליום{' '}
+                  <button className={btn} disabled={busy} onClick={() => { setEdit({ kind: 'cbudget', id: analysis.campaign!.id }); setEditVals({ ils: String(curToIls(analysis.campaign!.dailyBudget) ?? '') }); }}><Pencil className="w-3 h-3" /> שינוי</button>
+                  {edit?.kind === 'cbudget' && (
+                    <EditBox label="תקציב יומי חדש (₪):" busy={busy} onCancel={() => setEdit(null)}
+                      onSave={() => { const ils = Number(editVals.ils); const v = ilsToCur(ils); doManual('set_campaign_daily_budget', analysis.campaign!.id, { dailyBudget: v }, 'תקציב יומי לקמפיין', `תקציב הקמפיין: ₪${ils} ליום (${fmt(v, cur)}). שינוי של עד 50% בבת אחת.`, () => setAnalysis(a => (a && a.campaign ? { ...a, campaign: { ...a.campaign, dailyBudget: v } } : a))); }}>
+                      <input type="number" min={1} value={editVals.ils ?? ''} onChange={e => setEditVals({ ils: e.target.value })} className="w-24 border border-gray-300 rounded px-2 py-1" />
+                      {cur !== 'ILS' && rate && editVals.ils ? <span className="text-gray-500">≈ {fmt(ilsToCur(Number(editVals.ils)), cur)}</span> : null}
+                    </EditBox>
                   )}
                 </div>
-              ))}
+              )}
+              {analysis.adsets.map(s => {
+                const paused = (s.configuredStatus || s.status) !== 'ACTIVE';
+                return (
+                  <div key={s.id} className="bg-gray-50 rounded-lg p-2 space-y-1">
+                    <div className="font-bold text-gray-800">סט: {s.name} <span className="font-normal text-gray-500">· {statusHe(s.status)}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}{s.ageMin ? ` · גיל ${s.ageMin}–${s.ageMax}` : ''}</span></div>
+                    <div className="text-gray-600">7 ימים אחרונים: <MetricsCell m={s.m7} cur={cur} rate={rate} /> · 30 ימים אחרונים: <MetricsCell m={s.m30} cur={cur} rate={rate} /></div>
+                    {s.crm && <div><CrmLine crm={s.crm} periods={analysis.crmPeriods} /></div>}
+                    {canExecute && (
+                      <div className="flex flex-wrap gap-1.5 pt-0.5">
+                        <button className={btn} disabled={busy} onClick={() => doManual(paused ? 'activate_adset' : 'pause_adset', s.id, {}, `${paused ? 'הפעלת' : 'השהיית'} סט`, `${paused ? 'להפעיל' : 'להשהות'} את הסט "${s.name}"?`, () => patchAdset(s.id, { configuredStatus: paused ? 'ACTIVE' : 'PAUSED', status: paused ? 'ACTIVE' : 'PAUSED' }))}>
+                          {paused ? <><Play className="w-3 h-3" /> הפעל סט</> : <><Pause className="w-3 h-3" /> השהה סט</>}
+                        </button>
+                        {s.ageMin != null && (
+                          <button className={btn} disabled={busy} onClick={() => { setEdit({ kind: 'age', id: s.id }); setEditVals({ min: String(s.ageMin), max: String(s.ageMax) }); }}><Pencil className="w-3 h-3" /> גיל</button>
+                        )}
+                        {s.dailyBudget != null && (
+                          <button className={btn} disabled={busy} onClick={() => { setEdit({ kind: 'budget', id: s.id }); setEditVals({ ils: String(curToIls(s.dailyBudget) ?? '') }); }}><Pencil className="w-3 h-3" /> תקציב יומי</button>
+                        )}
+                      </div>
+                    )}
+                    {edit?.kind === 'age' && edit.id === s.id && (
+                      <EditBox label="גיל:" busy={busy} onCancel={() => setEdit(null)}
+                        onSave={() => { const min = Number(editVals.min), max = Number(editVals.max); doManual('set_adset_age', s.id, { ageMin: min, ageMax: max }, 'טווח גילאים', `גיל בסט "${s.name}": ${s.ageMin}–${s.ageMax} ← ${min}–${max}`, () => patchAdset(s.id, { ageMin: min, ageMax: max })); }}>
+                        <span>מ-</span><input type="number" min={18} max={65} value={editVals.min ?? ''} onChange={e => setEditVals(v => ({ ...v, min: e.target.value }))} className="w-16 border border-gray-300 rounded px-2 py-1" />
+                        <span>עד</span><input type="number" min={18} max={65} value={editVals.max ?? ''} onChange={e => setEditVals(v => ({ ...v, max: e.target.value }))} className="w-16 border border-gray-300 rounded px-2 py-1" />
+                        {s.advantageAudience ? <span className="text-amber-700">Advantage+ קהל פעיל - מטא עשויה להרחיב מעבר לטווח, וגיל מינימום עד 25 בלבד</span> : null}
+                      </EditBox>
+                    )}
+                    {edit?.kind === 'budget' && edit.id === s.id && (
+                      <EditBox label="תקציב יומי חדש (₪):" busy={busy} onCancel={() => setEdit(null)}
+                        onSave={() => { const ils = Number(editVals.ils); const v = ilsToCur(ils); doManual('set_adset_daily_budget', s.id, { dailyBudget: v }, 'תקציב יומי לסט', `תקציב בסט "${s.name}": ₪${ils} ליום (${fmt(v, cur)}). שינוי של עד 50% בבת אחת.`, () => patchAdset(s.id, { dailyBudget: v })); }}>
+                        <input type="number" min={1} value={editVals.ils ?? ''} onChange={e => setEditVals({ ils: e.target.value })} className="w-24 border border-gray-300 rounded px-2 py-1" />
+                        {cur !== 'ILS' && rate && editVals.ils ? <span className="text-gray-500">≈ {fmt(ilsToCur(Number(editVals.ils)), cur)}</span> : null}
+                      </EditBox>
+                    )}
+                    {analysis.ads.filter(a => a.adsetId === s.id).map(a => {
+                      const adPaused = (a.configuredStatus || a.status) !== 'ACTIVE';
+                      return (
+                        <div key={a.id} className="flex flex-wrap items-center gap-2 pr-3">
+                          {a.thumb && <img src={a.thumb} alt="" className="w-7 h-7 rounded object-cover" loading="lazy" />}
+                          <span className="text-gray-700">{a.name}</span>
+                          <span className="text-gray-500">· {statusHe(a.status)} · 7 ימים אחרונים: <MetricsCell m={a.m7} cur={cur} rate={rate} /></span>
+                          {a.crm && <span>· <CrmLine crm={a.crm} periods={analysis.crmPeriods} /></span>}
+                          {canExecute && (
+                            <button className={btn} disabled={busy} onClick={() => doManual(adPaused ? 'activate_ad' : 'pause_ad', a.id, {}, `${adPaused ? 'הפעלת' : 'השהיית'} מודעה`, `${adPaused ? 'להפעיל' : 'להשהות'} את המודעה "${a.name}"?`, () => patchAd(a.id, { configuredStatus: adPaused ? 'ACTIVE' : 'PAUSED', status: adPaused ? 'ACTIVE' : 'PAUSED' }))}>
+                              {adPaused ? <><Play className="w-3 h-3" /> הפעל</> : <><Pause className="w-3 h-3" /> השהה</>}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
             </div>
-          )}
-        </div>
+          </>
+        )}
+
+        {changes.length > 0 && (
+          <div className="space-y-1.5 pt-2 border-t border-gray-100">
+            <h4 className="font-bold text-sm text-gray-800">שינויים שבוצעו בקמפיין</h4>
+            {changes.map(c => (
+              <div key={c.id} className="flex items-start gap-2 text-xs bg-gray-50 rounded-lg p-2">
+                <div className="min-w-0 flex-1">
+                  <div className="font-bold text-gray-800">{c.title} <span className="font-normal text-gray-500">· {c.object_name}</span></div>
+                  <div className="text-gray-600">
+                    {describeChange(c.before, c.after, cur)} · {new Date(c.done_at).toLocaleString('he-IL')} · {c.done_by}
+                    {c.status === 'failed' && <span className="text-red-700"> · נכשל: {c.error}</span>}
+                    {c.undone_at && <span className="text-gray-500"> · בוטל</span>}
+                  </div>
+                </div>
+                {c.status === 'done' && !c.undone_at && !c.undo_of && (
+                  <button onClick={() => undo(c)} disabled={undoing === c.id} className="shrink-0 flex items-center gap-1 text-gray-700 border border-gray-300 rounded-lg px-2 py-1 hover:bg-white disabled:opacity-50">
+                    <Undo2 className="w-3.5 h-3.5" /> בטל
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

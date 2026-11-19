@@ -228,6 +228,9 @@ export default function AdsSnapshotView() {
 
   const toggle = (id: string) => setOpen(o => ({ ...o, [id]: !o[id] }));
 
+  // the campaign's analysis opens in the page, in place of the list (Haim, 2026-11-19 - not a pop-up)
+  if (optimizeFor) return <CampaignOptimizer campaign={optimizeFor} onBack={() => setOptimizeFor(null)} />;
+
   return (
     <div dir="rtl">
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 w-full flex flex-col">
@@ -450,7 +453,6 @@ export default function AdsSnapshotView() {
           )}
         </div>
       </div>
-      {optimizeFor && <CampaignOptimizer campaign={optimizeFor} onClose={() => setOptimizeFor(null)} />}
     </div>
   );
 }

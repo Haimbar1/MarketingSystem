@@ -72,6 +72,16 @@ async function allPages(path: string, token: string, params: Record<string, stri
 // ---------- reading the campaign ----------
 
 const LEAD_TYPES = ['lead', 'onsite_conversion.lead_grouped', 'offsite_conversion.fb_pixel_lead', 'leadgen_grouped'];
+// Bookings / purchases Meta attributed to the ads (from the pixel and the CRM's Conversions API events)
+const SCHEDULE_TYPES = ['schedule_total', 'schedule_website', 'offsite_conversion.fb_pixel_schedule', 'schedule'];
+const PURCHASE_TYPES = ['omni_purchase', 'purchase', 'offsite_conversion.fb_pixel_purchase', 'onsite_web_purchase'];
+const actionOf = (row: any, types: string[]) => {
+  for (const t of types) {
+    const a = (row?.actions || []).find((x: any) => x.action_type === t);
+    if (a) return Number(a.value) || 0;
+  }
+  return 0;
+};
 const leadsOf = (row: any) => {
   for (const t of LEAD_TYPES) {
     const a = (row?.actions || []).find((x: any) => x.action_type === t);
@@ -184,6 +194,7 @@ async function ilsPerUnit(currency: string): Promise<number | null> {
 
 export async function readCampaign(creds: Creds, campaignId: string) {
   const { token, accountId } = creds;
+  const regionsP = allPages(`${campaignId}/insights`, token, { level: 'campaign', time_range: JSON.stringify({ since: shiftDay(israelToday(), -59), until: israelToday() }), breakdowns: 'region', fields: 'spend,impressions,clicks,actions' });
   const [account, campaign, adsets, ads, ins7Adset, ins30Adset, ins7Ad, ins30Ad, daily, placements, ageGender, ruleSets] = await Promise.all([
     gget(accountId, token, { fields: 'currency,timezone_name,min_daily_budget,name' }),
     gget(campaignId, token, { fields: 'id,name,status,effective_status,objective,buying_type,bid_strategy,daily_budget,lifetime_budget,special_ad_categories,start_time,account_id' }),
@@ -195,7 +206,7 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     allPages(`${campaignId}/insights`, token, { level: 'ad', date_preset: 'last_30d', fields: INSIGHT_FIELDS }),
     allPages(`${campaignId}/insights`, token, { level: 'campaign', date_preset: 'last_14d', time_increment: '1', fields: 'spend,impressions,clicks,actions,date_start' }),
     allPages(`${campaignId}/insights`, token, { level: 'campaign', date_preset: 'last_30d', breakdowns: 'publisher_platform,platform_position', fields: 'spend,impressions,clicks,ctr,actions' }),
-    allPages(`${campaignId}/insights`, token, { level: 'campaign', date_preset: 'last_30d', breakdowns: 'age,gender', fields: 'spend,impressions,clicks,actions' }),
+    allPages(`${campaignId}/insights`, token, { level: 'campaign', time_range: JSON.stringify({ since: shiftDay(israelToday(), -59), until: israelToday() }), breakdowns: 'age,gender', fields: 'spend,impressions,clicks,actions' }),
     allPages(`${accountId}/value_rule_set`, token, { fields: 'id,name,status' }),
   ]);
   const currency = account.data?.currency || '';
@@ -206,7 +217,7 @@ export async function readCampaign(creds: Creds, campaignId: string) {
       campaignId, campaignName: campaign.data?.name || '',
       adsets: adsets.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
       ads: ads.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
-      periods: [...periods, ...weeks].map(p => ({ key: p.key, since: p.since, until: p.until })),
+      periods: [...periods, ...weeks, { key: 'p60', since: shiftDay(israelToday(), -59), until: israelToday() }].map(p => ({ key: p.key, since: p.since, until: p.until })),
     }),
     ilsPerUnit(currency),
   ]);
@@ -236,6 +247,11 @@ export async function readCampaign(creds: Creds, campaignId: string) {
         return { ...w, spendIls: t?.spendIls ?? null, leads: t?.leads ?? 0, booked: t?.booked ?? 0, buyers: t?.buyers ?? 0, revenue: t?.revenue ?? 0 };
       })
     : null;
+  // the CRM's leads of the last 60 days by city (all Meta leads, like the dashboard's bottom line)
+  const p60: any = Array.isArray(crmRes?.periods) ? crmRes.periods.find((x: any) => x.key === 'p60') : null;
+  const crmCities = p60?.total?.byCity
+    ? Object.entries(p60.total.byCity as Record<string, any>).map(([city, c]) => ({ city, ...c })).sort((a: any, b: any) => b.leads - a.leads)
+    : null;
   if (!campaign.ok) throw new Error(metaErr(campaign.data));
   if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) throw new Error('הקמפיין לא שייך לחשבון המודעות של העסק');
   const by = (rows: any[], key: string) => new Map(rows.map(r => [String(r[key]), r]));
@@ -246,6 +262,7 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     ilsRate,
     crm,
     crmWeeks,
+    crmCities,
     timezone: account.data?.timezone_name || '',
     minDailyBudget: num(account.data?.min_daily_budget),
     campaign: campaign.data,
@@ -253,7 +270,8 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     ads: ads.rows.map(a => ({ ...a, m7: metrics(d7.get(String(a.id))), m30: metrics(d30.get(String(a.id))) })),
     daily: daily.rows.map(r => ({ date: r.date_start, spend: round(num(r.spend)), leads: leadsOf(r), clicks: num(r.clicks) })),
     placements: placements.rows.map(r => ({ platform: r.publisher_platform, position: r.platform_position, spend: round(num(r.spend)), impressions: num(r.impressions), ctr: round(num(r.ctr)), leads: leadsOf(r) })),
-    ageGender: ageGender.rows.map(r => ({ age: r.age, gender: r.gender, spend: round(num(r.spend)), leads: leadsOf(r) })),
+    ageGender: ageGender.rows.map(r => ({ age: r.age, gender: r.gender, spend: round(num(r.spend)), leads: leadsOf(r), booked: actionOf(r, SCHEDULE_TYPES), purchases: actionOf(r, PURCHASE_TYPES) })),
+    regions: (await regionsP).rows.map(r => ({ region: r.region, spend: round(num(r.spend)), leads: leadsOf(r), booked: actionOf(r, SCHEDULE_TYPES), purchases: actionOf(r, PURCHASE_TYPES) })),
     valueRuleSets: ruleSets.rows,
     readErrors: [adsets, ads, ins7Adset, ins30Adset, daily, placements, ageGender].filter(x => !x.ok).map(x => x.error),
   };
@@ -298,7 +316,9 @@ function forAi(d: CampaignData) {
     })),
     last14DaysByDay: d.daily,
     placementsLast30: d.placements,
-    ageGenderLast30: d.ageGender,
+    ageGenderLast60: d.ageGender,
+    regionsLast60: d.regions,
+    crmLeadsByCityLast60: d.crmCities?.slice(0, 15) || null,
     valueRuleSetsInAccount: d.valueRuleSets.map((r: any) => ({ id: r.id, name: r.name })),
   };
 }
@@ -312,6 +332,7 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta (פייסב�
 - כשיש נתוני CRM - הם קובעים יותר מהעלות לליד: סט/מודעה עם לידים יקרים יותר אבל יותר תורים ורכישות עדיף על לידים זולים שלא קובעים.
 - אם crm חסר בסט/מודעה - ייתכן שהלידים לא שויכו (leadsWithUnknownAdset); לא להסיק מזה שאין תוצאות.
 - לציין בממצאים את העלות לתור ואת ה-ROAS כשאפשר.
+- ageGenderLast60 / regionsLast60: הוצאה, לידים, ותורים / רכישות כפי שמטא שייכה אותם למודעות (חלקי - מטא משייכת רק חלק מהאירועים). crmLeadsByCityLast60: לידי Meta ב-CRM לפי עיר (רק לידים שהעיר שלהם ידועה). אפשר להציע שינוי גיל (set_adset_age) כשקבוצת גיל מוציאה הרבה ומביאה מעט.
 - בטקסטים (summary / findings / why / expected) לכתוב סכומים בשקלים בלבד (₪, אחרי המרה לפי ilsPerCurrencyUnit), לא בדולרים ולא "USD". רק ב-params.dailyBudget - המספר במטבע החשבון.
 
 כללים מקצועיים:
@@ -483,6 +504,48 @@ async function writeTarget(token: string, type: string, id: string, current: any
   return gpost(id, token, body);
 }
 
+// ---------- executing approved changes ----------
+
+// Runs the approved items of a stored optimization (AI suggestions or a manual change): re-reads each
+// target, skips it if it changed in Meta since, writes, and logs to mk_changes (undoable).
+async function executeItems(p: any, creds: Creds, opt: any, items: any[]) {
+    const results: any[] = [];
+    for (const item of items) {
+      const sug: Suggestion | undefined = (opt.suggestions || []).find((x: Suggestion) => x.id === item?.suggestionId);
+      if (!sug || !sug.executable || !sug.targetId || !sug.targetType || !sug.before || !sug.after) {
+        results.push({ suggestionId: item?.suggestionId, ok: false, error: 'ההמלצה לא ניתנת לביצוע אוטומטי' });
+        continue;
+      }
+      let after = { ...sug.after };
+      // a budget the person changed before approving - same ±50% limit from the value at analysis
+      if ('daily_budget' in after && item.dailyBudget != null) {
+        const cur = num(sug.before.daily_budget);
+        const wanted = Math.round(num(item.dailyBudget) * 100);
+        if (!wanted || wanted < cur * 0.5 || wanted > cur * 1.5) {
+          results.push({ suggestionId: sug.id, ok: false, error: `תקציב מחוץ לטווח המותר (${round(cur * 0.5 / 100)}–${round(cur * 1.5 / 100)})` });
+          continue;
+        }
+        after = { daily_budget: wanted };
+      }
+      const now = await readTarget(creds.token, sug.targetType, sug.targetId);
+      if (!now.ok) { results.push({ suggestionId: sug.id, ok: false, error: metaErr(now.data) }); continue; }
+      if (!stillAsBefore(now.data, sug.before)) {
+        results.push({ suggestionId: sug.id, ok: false, error: 'השתנה במטא מאז הניתוח - לא בוצע. נתחו שוב.' });
+        continue;
+      }
+      const w = await writeTarget(creds.token, sug.targetType, sug.targetId, now.data, after);
+      const ok = w.ok && w.data?.success !== false;
+      await p.query(
+        `INSERT INTO mk_changes (tenant_id, optimization_id, suggestion_id, campaign_id, object_type, object_id, object_name, action, title, before, after, status, error, done_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)`,
+        [currentTenant(), opt.id, sug.id, opt.campaign_id, sug.targetType, sug.targetId, sug.targetName || null, sug.action, sug.title,
+          JSON.stringify(sug.before), JSON.stringify(after), ok ? 'done' : 'failed', ok ? null : metaErr(w.data), who()],
+      );
+      results.push({ suggestionId: sug.id, ok, error: ok ? undefined : metaErr(w.data) });
+    }
+  return results;
+}
+
 // ---------- routes ----------
 
 const who = () => currentUser()?.email || 'unknown';
@@ -507,8 +570,13 @@ export function registerOptimizerRoutes(app: express.Express) {
         crmPeriods: data.crm ? data.crm.map((p: any) => ({ key: p.key, label: p.label, since: p.since, until: p.until, maturity: p.maturity, spendIls: p.spendIls, fbLeads: p.fbLeads, leads: p.leads ?? 0, booked: p.booked ?? 0, buyers: p.buyers ?? 0, revenue: p.revenue ?? 0, campaignSpendIls: p.campaignSpendIls ?? null, campaignsWithSpend: p.campaignsWithSpend ?? null })) : null,
         ilsRate: data.ilsRate,
         crmWeeks: data.crmWeeks,
-        adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAdset?.[String(s.id)] || null])) : null })),
-        ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAd?.[String(a.id)] || null])) : null })),
+        campaign: { id: String(data.campaign.id), name: data.campaign.name, dailyBudget: data.campaign.daily_budget ? round(num(data.campaign.daily_budget) / 100) : null, status: data.campaign.effective_status },
+        audience: {
+          since: shiftDay(israelToday(), -59), until: israelToday(),
+          ageGender: data.ageGender, regions: data.regions, crmCities: data.crmCities,
+        },
+        adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, configuredStatus: s.status, ageMin: s.targeting?.age_min || 18, ageMax: s.targeting?.age_max || 65, advantageAudience: s.targeting?.targeting_automation?.advantage_audience === 1, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAdset?.[String(s.id)] || null])) : null })),
+        ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, configuredStatus: a.status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAd?.[String(a.id)] || null])) : null })),
         daily: data.daily,
         readErrors: data.readErrors,
       };
@@ -540,44 +608,72 @@ export function registerOptimizerRoutes(app: express.Express) {
       if (!opt) return res.status(404).json({ success: false, error: 'הניתוח לא נמצא' });
       if (Date.now() - new Date(opt.created_at).getTime() > 24 * 3600_000) return res.json({ success: false, error: 'הניתוח ישן מיותר מיום - נתחו שוב לפני ביצוע' });
       const items: any[] = Array.isArray(req.body?.items) ? req.body.items.slice(0, 20) : [];
-      const results: any[] = [];
-      for (const item of items) {
-        const sug: Suggestion | undefined = (opt.suggestions || []).find((x: Suggestion) => x.id === item?.suggestionId);
-        if (!sug || !sug.executable || !sug.targetId || !sug.targetType || !sug.before || !sug.after) {
-          results.push({ suggestionId: item?.suggestionId, ok: false, error: 'ההמלצה לא ניתנת לביצוע אוטומטי' });
-          continue;
-        }
-        let after = { ...sug.after };
-        // a budget the person changed before approving - same ±50% limit from the value at analysis
-        if ('daily_budget' in after && item.dailyBudget != null) {
-          const cur = num(sug.before.daily_budget);
-          const wanted = Math.round(num(item.dailyBudget) * 100);
-          if (!wanted || wanted < cur * 0.5 || wanted > cur * 1.5) {
-            results.push({ suggestionId: sug.id, ok: false, error: `תקציב מחוץ לטווח המותר (${round(cur * 0.5 / 100)}–${round(cur * 1.5 / 100)})` });
-            continue;
-          }
-          after = { daily_budget: wanted };
-        }
-        const now = await readTarget(creds.token, sug.targetType, sug.targetId);
-        if (!now.ok) { results.push({ suggestionId: sug.id, ok: false, error: metaErr(now.data) }); continue; }
-        if (!stillAsBefore(now.data, sug.before)) {
-          results.push({ suggestionId: sug.id, ok: false, error: 'השתנה במטא מאז הניתוח - לא בוצע. נתחו שוב.' });
-          continue;
-        }
-        const w = await writeTarget(creds.token, sug.targetType, sug.targetId, now.data, after);
-        const ok = w.ok && w.data?.success !== false;
-        await p.query(
-          `INSERT INTO mk_changes (tenant_id, optimization_id, suggestion_id, campaign_id, object_type, object_id, object_name, action, title, before, after, status, error, done_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)`,
-          [currentTenant(), opt.id, sug.id, opt.campaign_id, sug.targetType, sug.targetId, sug.targetName || null, sug.action, sug.title,
-            JSON.stringify(sug.before), JSON.stringify(after), ok ? 'done' : 'failed', ok ? null : metaErr(w.data), who()],
-        );
-        results.push({ suggestionId: sug.id, ok, error: ok ? undefined : metaErr(w.data) });
-      }
+      const results = await executeItems(p, creds, opt, items);
       res.json({ success: true, results });
     } catch (e: any) {
       console.error('[optimizer execute]', e?.message);
       res.json({ success: false, error: e?.message || 'שגיאה בביצוע' });
+    }
+  });
+
+  // The latest stored analysis of a campaign (the screen shows it instead of re-running; Haim,
+  // 2026-11-19 - "the data hardly changes within an hour").
+  app.get('/api/meta-ads/campaigns/:id/latest', async (req, res) => {
+    if (!db()) return res.json({ success: true, latest: null });
+    try {
+      const p = await ensureTables();
+      const r = await p.query(
+        `SELECT id, created_at, created_by, analysis, suggestions FROM mk_optimizations
+          WHERE tenant_id = $1 AND campaign_id = $2 AND NOT (analysis ? 'manual') ORDER BY created_at DESC LIMIT 1`,
+        [currentTenant(), String(req.params.id).replace(/\D/g, '')],
+      );
+      const row = r.rows[0];
+      res.json({ success: true, latest: row ? { optimizationId: Number(row.id), createdAt: row.created_at, createdBy: row.created_by, analysis: row.analysis, suggestions: row.suggestions } : null });
+    } catch (e: any) {
+      res.json({ success: false, error: e?.message });
+    }
+  });
+
+  // A change the person makes by hand (age range, daily budget, pause / activate an ad set or ad):
+  // the same checks as an AI suggestion (validate), then executed and logged the same way (undoable).
+  // body: { action, targetId, params }
+  app.post('/api/meta-ads/campaigns/:id/manual-change', async (req, res) => {
+    if (!db()) return res.json({ success: false, error: 'כדי לבצע שינויים צריך מסד נתונים (DATABASE_URL ב-Vercel)' });
+    try {
+      const p = await ensureTables();
+      const creds = await adsCredsForCurrentBusiness();
+      if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
+      const campaignId = String(req.params.id).replace(/\D/g, '');
+      const { token, accountId } = creds;
+      const [account, campaign, adsets, ads, ruleSets] = await Promise.all([
+        gget(accountId, token, { fields: 'currency,min_daily_budget' }),
+        gget(campaignId, token, { fields: 'id,name,status,daily_budget,lifetime_budget,account_id' }),
+        allPages(`${campaignId}/adsets`, token, { fields: ADSET_FIELDS }),
+        allPages(`${campaignId}/ads`, token, { fields: 'id,name,adset_id,status' }),
+        allPages(`${accountId}/value_rule_set`, token, { fields: 'id,name,status' }),
+      ]);
+      if (!campaign.ok) return res.json({ success: false, error: metaErr(campaign.data) });
+      if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) return res.json({ success: false, error: 'הקמפיין לא שייך לחשבון המודעות של העסק' });
+      const currency = account.data?.currency || '';
+      const d: any = { currency, ilsRate: await ilsPerUnit(currency), minDailyBudget: num(account.data?.min_daily_budget), campaign: campaign.data, adsets: adsets.rows, ads: ads.rows, valueRuleSets: ruleSets.rows };
+      const b = req.body || {};
+      const sug = validate({ action: b.action, targetId: b.targetId, params: b.params || {}, title: String(b.title || 'שינוי ידני'), why: 'שינוי ידני', risk: 'low' }, d, 0);
+      if (!sug.executable) return res.json({ success: false, error: sug.note || 'השינוי הזה לא אפשרי' });
+      // a budget the person typed is executed as typed or not at all (an AI suggestion is trimmed instead)
+      if (sug.note && sug.before && 'daily_budget' in sug.before) {
+        const cur = num(sug.before.daily_budget) / 100;
+        return res.json({ success: false, error: `אפשר לשנות תקציב בעד 50% בבת אחת: בין ${round(cur * 0.5)} ל-${round(cur * 1.5)} ${({ USD: 'דולר', EUR: 'יורו', ILS: 'ש"ח' } as Record<string, string>)[currency] || currency} ליום${d.ilsRate && currency !== 'ILS' ? ` (₪${Math.round(cur * 0.5 * d.ilsRate)}–₪${Math.round(cur * 1.5 * d.ilsRate)})` : ''}` });
+      }
+      sug.id = 'm1';
+      const ins = await p.query(
+        `INSERT INTO mk_optimizations (tenant_id, campaign_id, campaign_name, created_by, analysis, suggestions) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id, created_at, campaign_id`,
+        [currentTenant(), campaignId, campaign.data?.name || null, who(), JSON.stringify({ manual: true }), JSON.stringify([sug])],
+      );
+      const results = await executeItems(p, creds, { ...ins.rows[0], suggestions: [sug] }, [{ suggestionId: 'm1' }]);
+      res.json({ success: !!results[0]?.ok, error: results[0]?.error, note: sug.note, change: { before: sug.before, after: sug.after, targetName: sug.targetName } });
+    } catch (e: any) {
+      console.error('[optimizer manual]', e?.message);
+      res.json({ success: false, error: e?.message || 'שגיאה בשינוי' });
     }
   });
 
