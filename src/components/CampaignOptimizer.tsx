@@ -12,7 +12,11 @@ type Suggestion = {
 };
 type Crm = { leads: number; booked: number; buyers: number; revenue: number };
 type CrmWin = Record<string, Crm | null> | null; // by period key (last7 / last30 / prev30)
-type CrmPeriod = Crm & { key: string; label: string; since: string; until: string; maturity: 'early' | 'partial' | 'mature'; spendIls: number | null; fbLeads: number | null };
+type CrmPeriod = Crm & {
+  key: string; label: string; since: string; until: string; maturity: 'early' | 'partial' | 'mature'; spendIls: number | null; fbLeads: number | null;
+  onlyCampaign?: boolean; withoutCampaign?: number; // the only campaign that spent: = the dashboard's bottom line, incl. Meta leads with no campaign
+  dashboardTotal?: (Crm & { spendIls: number; campaigns: number }) | null; // several campaigns spent: the dashboard's bottom line, for reference
+};
 type Analysis = {
   summary: string; health: 'good' | 'ok' | 'bad'; findings: string[]; currency: string;
   totals: { last7: any; last30: any };
@@ -115,8 +119,8 @@ function SummaryTable({ a }: { a: Analysis }) {
             </tr>
           </thead>
           <tbody>
-            {a.crmPeriods.map(p => (
-              <tr key={p.key} className={`border-t border-gray-100 ${p.maturity === 'mature' ? 'bg-emerald-50/40' : ''}`}>
+            {a.crmPeriods.map(p => (<React.Fragment key={p.key}>
+              <tr className={`border-t border-gray-100 ${p.maturity === 'mature' ? 'bg-emerald-50/40' : ''}`}>
                 <td className={`${td} font-bold`}>{p.label} <span className="font-normal text-gray-400">({dd(p.since)} עד {dd(p.until)})</span></td>
                 <td className={td}>{shekel(p.spendIls)}</td>
                 <td className={td}>{p.fbLeads ?? '—'}</td>
@@ -128,12 +132,20 @@ function SummaryTable({ a }: { a: Analysis }) {
                 <td className={td}>{p.maturity === 'early' ? <span className="text-gray-400">{shekel(p.revenue)}</span> : shekel(p.revenue)}</td>
                 <td className={td}>{roasCell(p)}</td>
               </tr>
-            ))}
+              {p.dashboardTotal && (
+                <tr className="text-gray-500">
+                  <td className="px-2 pb-1.5 text-[10px] whitespace-nowrap" colSpan={10}>
+                    בדשבורד ה-CRM לאותם ימים (כל {p.dashboardTotal.campaigns} הקמפיינים + לידי Meta בלי קמפיין): הוצאה {shekel(p.dashboardTotal.spendIls)} · {p.dashboardTotal.leads} לידים · {p.dashboardTotal.booked} קבעו תור · {p.dashboardTotal.buyers} קנו · {shekel(p.dashboardTotal.revenue)}
+                  </td>
+                </tr>
+              )}
+            </React.Fragment>))}
           </tbody>
         </table>
         <p className="text-[10px] text-gray-400 mt-1">
           החישוב זהה לטבלת "החזר השקעה מפייסבוק" בדשבורד של ה-CRM לאותם ימים: הלידים לפי יום הכניסה שלהם, הרכישות שלהם מאז, וההוצאה בשקלים לפי שער כל יום.
           לידים של השבוע האחרון עוד לא הספיקו לקנות - לכן אין להם החזר; ההחזר האמיתי הוא של הלידים מלפני 30–60 יום.
+          {a.crmPeriods.some(p => p.onlyCampaign && p.withoutCampaign) ? ` בתקופות שבהן זה הקמפיין היחיד שרץ, נספרים גם לידי Meta שאין להם שם קמפיין ב-CRM (${a.crmPeriods.filter(p => p.onlyCampaign).map(p => `${p.label}: ${p.withoutCampaign}`).join(', ')}) - כמו בשורה התחתונה של הדשבורד.` : ''}
         </p>
       </div>
     );
