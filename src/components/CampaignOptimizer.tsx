@@ -502,7 +502,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                           )}
                           {mediaFor === a.id && (
                             <div className="basis-full">
-                              <AdMediaPanel ad={{ id: a.id, name: a.name }} onClose={() => setMediaFor(null)}
+                              <AdMediaPanel ad={{ id: a.id, name: a.name }} rate={rate} currency={cur} onClose={() => setMediaFor(null)}
                                 onDone={text => { setMediaFor(null); setNotice({ ok: true, text }); loadChanges(); }} />
                             </div>
                           )}

@@ -8,9 +8,41 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Loader2, Upload } from 'lucide-react';
 
 const PIECE = 3 * 1024 * 1024;
-type AdInfo = { kind: string; videos: { id: string; thumb: string | null }[]; images: number };
+type VideoInfo = { id: string; title: string | null; thumb: string | null; length: number | null; source: string | null; created: string | null; perf: { spend: number; impressions: number; leads: number } | null };
+type AdInfo = { kind: string; videos: VideoInfo[]; images: number };
 
-export default function AdMediaPanel({ ad, onDone, onClose }: { ad: { id: string; name: string }; onDone: (text: string) => void; onClose: () => void }) {
+const mmss = (sec: number | null) => (sec == null ? '' : `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`);
+
+// One of the ad's videos as a card: picture (plays when Meta gives the file), title, length, and its
+// last 30 days in a flexible ad - so it's clear what each video is (Haim, 2026-11-19).
+function VideoCard({ v, i, selected, onPick, rate, currency }: { v: VideoInfo; i: number; selected?: boolean; onPick?: () => void; rate: number | null; currency: string }) {
+  const [play, setPlay] = useState(false);
+  const spend = v.perf ? (currency === 'ILS' || !rate ? v.perf.spend : v.perf.spend * rate) : 0;
+  return (
+    <div onClick={onPick} className={`flex gap-2 items-start rounded-lg border p-2 ${onPick ? 'cursor-pointer' : ''} ${selected ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-white'}`}>
+      <div className="w-24 shrink-0" onClick={e => e.stopPropagation()}>
+        {play && v.source ? (
+          <video src={v.source} poster={v.thumb || undefined} controls autoPlay className="w-24 h-24 rounded object-cover bg-black" />
+        ) : (
+          <button type="button" onClick={() => v.source && setPlay(true)} className="relative block w-24 h-24 rounded overflow-hidden bg-gray-100" title={v.source ? 'הפעלה' : ''}>
+            {v.thumb ? <img src={v.thumb} alt="" className="w-full h-full object-cover" /> : <span className="text-2xl">🎬</span>}
+            {v.source && <span className="absolute inset-0 flex items-center justify-center text-white text-2xl drop-shadow">▶</span>}
+          </button>
+        )}
+      </div>
+      <div className="min-w-0 space-y-0.5">
+        <div className="font-bold text-gray-800">סרטון {i + 1}{v.length ? ` · ${mmss(v.length)}` : ''}</div>
+        {v.title && <div className="text-gray-600 truncate" title={v.title}>{v.title}</div>}
+        {v.created && <div className="text-gray-400">הועלה {new Date(v.created).toLocaleDateString('he-IL')}</div>}
+        {v.perf ? (
+          <div className="text-gray-700">30 יום: ₪{Math.round(spend).toLocaleString('he-IL')} · {v.perf.leads} לידים{v.perf.leads ? ` · ₪${Math.round(spend / v.perf.leads)} לליד` : ''}</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export default function AdMediaPanel({ ad, onDone, onClose, rate = null, currency = '' }: { ad: { id: string; name: string }; onDone: (text: string) => void; onClose: () => void; rate?: number | null; currency?: string }) {
   const [info, setInfo] = useState<AdInfo | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState<'new_ad' | 'replace'>('new_ad');
@@ -103,25 +135,38 @@ export default function AdMediaPanel({ ad, onDone, onClose }: { ad: { id: string
             <div className="flex items-center gap-2"><span>שם המודעה החדשה:</span>
               <input value={newAdName} onChange={e => setNewAdName(e.target.value)} disabled={busy} className="flex-1 border border-gray-300 rounded px-2 py-1" /></div>
           )}
+          {info.kind === 'video' && info.videos[0] && (
+            <div className="space-y-1">
+              <div className="text-gray-600">הסרטון שבמודעה עכשיו:</div>
+              <VideoCard v={info.videos[0]} i={0} rate={rate} currency={currency} />
+            </div>
+          )}
           {info.kind === 'flexible' && (
-            <div className="space-y-1 bg-gray-50 rounded p-2">
-              <div className="text-gray-600">זו מודעה גמישה ({info.videos.length} סרטונים, {info.images} תמונות):</div>
-              <label className="flex items-center gap-2"><input type="radio" checked={feed === 'add'} onChange={() => setFeed('add')} disabled={busy} /> להוסיף את הסרטון לצד הקיימים</label>
+            <div className="space-y-1.5 bg-gray-50 rounded p-2">
+              <div className="text-gray-600">זו מודעה גמישה ({info.videos.length} סרטונים, {info.images} תמונות) - מטא מציגה לכל אחד את מה שמתאים לו:</div>
+              <label className="flex items-center gap-2"><input type="radio" checked={feed === 'add'} onChange={() => setFeed('add')} disabled={busy} /> להוסיף את הסרטון החדש לצד הקיימים</label>
               {info.videos.length > 0 && (
-                <label className="flex items-center gap-2 flex-wrap"><input type="radio" checked={feed === 'replace'} onChange={() => setFeed('replace')} disabled={busy} /> להחליף את הסרטון:
-                  <select value={replaceVideoId} onChange={e => setReplaceVideoId(e.target.value)} disabled={busy || feed !== 'replace'} className="border border-gray-300 rounded px-1 py-0.5">
-                    {info.videos.map((v, i) => <option key={v.id} value={v.id}>סרטון {i + 1} ({v.id})</option>)}
-                  </select>
-                </label>
+                <label className="flex items-center gap-2"><input type="radio" checked={feed === 'replace'} onChange={() => setFeed('replace')} disabled={busy} /> להחליף אחד מהם - לחצו על הסרטון שמחליפים:</label>
               )}
+              <div className="grid sm:grid-cols-2 gap-1.5">
+                {info.videos.map((v, i) => (
+                  <VideoCard key={v.id} v={v} i={i} rate={rate} currency={currency}
+                    selected={feed === 'replace' && replaceVideoId === v.id}
+                    onPick={busy ? undefined : () => { setFeed('replace'); setReplaceVideoId(v.id); }} />
+                ))}
+              </div>
+              {info.videos.some(v => v.perf) ? <p className="text-[10px] text-gray-400">הנתונים לפי מטא, לכל סרטון במודעה (30 הימים האחרונים).</p> : null}
             </div>
           )}
 
           {stage === 'pick' && (
             <div className="flex items-center gap-2 flex-wrap">
-              <input type="file" accept="video/*" onChange={e => setFile(e.target.files?.[0] || null)} />
-              <button onClick={upload} disabled={!file} className="inline-flex items-center gap-1 bg-blue-600 text-white font-bold rounded px-3 py-1 disabled:opacity-50"><Upload className="w-3.5 h-3.5" /> העלאה למטא</button>
-              {file && <span className="text-gray-500">{(file.size / 1024 / 1024).toFixed(1)}MB</span>}
+              <label className="inline-flex items-center gap-1 bg-white border-2 border-dashed border-blue-300 text-blue-800 font-bold rounded-lg px-3 py-1.5 cursor-pointer hover:bg-blue-50">
+                📁 {file ? 'החלפת קובץ' : 'בחירת סרטון מהמחשב / מהטלפון'}
+                <input type="file" accept="video/*" className="hidden" onChange={e => setFile(e.target.files?.[0] || null)} />
+              </label>
+              {file ? <span className="text-gray-700">{file.name} · {(file.size / 1024 / 1024).toFixed(1)}MB</span> : <span className="text-gray-400">קודם בוחרים קובץ, אחר כך "העלאה למטא"</span>}
+              <button onClick={upload} disabled={!file} className="inline-flex items-center gap-1 bg-blue-600 text-white font-bold rounded px-3 py-1.5 disabled:opacity-40"><Upload className="w-3.5 h-3.5" /> העלאה למטא</button>
             </div>
           )}
           {stage === 'uploading' && (

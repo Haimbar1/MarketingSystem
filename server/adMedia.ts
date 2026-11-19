@@ -201,7 +201,37 @@ export function registerAdMediaRoutes(app: express.Express) {
       const c = r.data?.creative || {};
       const afs = c.asset_feed_spec;
       const kind = afs ? 'flexible' : c.object_story_spec?.link_data?.child_attachments ? 'carousel' : c.object_story_spec?.video_data ? 'video' : c.object_story_spec?.link_data ? 'image' : c.object_story_spec ? 'other' : 'post';
-      res.json({ success: true, kind, videos: (afs?.videos || []).map((v: any) => ({ id: String(v.video_id), thumb: v.thumbnail_url || null })), images: (afs?.images || []).length });
+      const ids: string[] = afs ? (afs.videos || []).map((v: any) => String(v.video_id)) : c.object_story_spec?.video_data?.video_id ? [String(c.object_story_spec.video_data.video_id)] : [];
+      // what each video is (Haim, 2026-11-19 - "I don't understand what's in each video, only an id"):
+      // its picture, title, length and a playable link when Meta gives one ...
+      const details: Record<string, any> = {};
+      if (ids.length) {
+        const d = await gget('', creds.token, { ids: ids.join(','), fields: 'title,picture,length,source,created_time' });
+        if (d.ok) Object.assign(details, d.data || {});
+        else {
+          const d2 = await gget('', creds.token, { ids: ids.join(','), fields: 'title,picture,length,created_time' });
+          if (d2.ok) Object.assign(details, d2.data || {});
+        }
+      }
+      // ... and, for a flexible ad, how each one did in the last 30 days (Meta's per-asset breakdown)
+      const perf: Record<string, any> = {};
+      if (afs && ids.length > 1) {
+        const ins = await gget(`${String(req.params.adId).replace(/\D/g, '')}/insights`, creds.token, { breakdowns: 'video_asset', date_preset: 'last_30d', fields: 'spend,impressions,clicks,actions' });
+        for (const row of ins.ok ? ins.data?.data || [] : []) {
+          const vid = String(row.video_asset?.video_id || row.video_asset?.id || '');
+          if (!vid) continue;
+          const lead = (row.actions || []).find((a: any) => ['lead', 'onsite_conversion.lead_grouped', 'offsite_conversion.fb_pixel_lead'].includes(a.action_type));
+          perf[vid] = { spend: Number(row.spend) || 0, impressions: Number(row.impressions) || 0, leads: lead ? Number(lead.value) || 0 : 0 };
+        }
+      }
+      const thumbOf = (id: string) => (afs?.videos || []).find((v: any) => String(v.video_id) === id)?.thumbnail_url || null;
+      res.json({
+        success: true, kind, images: (afs?.images || []).length,
+        videos: ids.map(id => ({
+          id, title: details[id]?.title || null, thumb: details[id]?.picture || thumbOf(id), length: details[id]?.length ? Math.round(Number(details[id].length)) : null,
+          source: details[id]?.source || null, created: details[id]?.created_time || null, perf: perf[id] || null,
+        })),
+      });
     } catch (e: any) {
       res.json({ success: false, error: e?.message || 'שגיאה' });
     }
