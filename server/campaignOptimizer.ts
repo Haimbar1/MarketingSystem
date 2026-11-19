@@ -448,16 +448,15 @@ export function registerOptimizerRoutes(app: express.Express) {
         readErrors: data.readErrors,
       };
       let optimizationId: number | null = null;
-      const p = db();
-      if (p) {
-        await ensureTables();
+      if (db()) {
+        const p = await ensureTables();
         const r = await p.query(
           `INSERT INTO mk_optimizations (tenant_id, campaign_id, campaign_name, created_by, analysis, suggestions) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id`,
           [currentTenant(), campaignId, data.campaign.name || null, who(), JSON.stringify(analysis), JSON.stringify(suggestions)],
         );
         optimizationId = Number(r.rows[0].id);
       }
-      res.json({ success: true, optimizationId, campaign: { id: campaignId, name: data.campaign.name, objective: data.campaign.objective }, analysis, suggestions, canExecute: !!p });
+      res.json({ success: true, optimizationId, campaign: { id: campaignId, name: data.campaign.name, objective: data.campaign.objective }, analysis, suggestions, canExecute: !!db() });
     } catch (e: any) {
       console.error('[optimizer analyze]', e?.message);
       res.json({ success: false, error: e?.message || 'שגיאה בניתוח' });
@@ -466,10 +465,9 @@ export function registerOptimizerRoutes(app: express.Express) {
 
   // body: { items: [{ suggestionId, dailyBudget? }] }
   app.post('/api/meta-ads/optimizations/:id/execute', async (req, res) => {
-    const p = db();
-    if (!p) return res.json({ success: false, error: 'כדי לבצע שינויים צריך מסד נתונים (DATABASE_URL ב-Vercel) - כל שינוי נשמר עם אפשרות ביטול' });
+    if (!db()) return res.json({ success: false, error: 'כדי לבצע שינויים צריך מסד נתונים (DATABASE_URL ב-Vercel) - כל שינוי נשמר עם אפשרות ביטול' });
     try {
-      await ensureTables();
+      const p = await ensureTables();
       const creds = await adsCredsForCurrentBusiness();
       if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
       const r = await p.query('SELECT * FROM mk_optimizations WHERE id = $1 AND tenant_id = $2', [Number(req.params.id), currentTenant()]);
@@ -519,10 +517,9 @@ export function registerOptimizerRoutes(app: express.Express) {
   });
 
   app.get('/api/meta-ads/campaigns/:id/changes', async (req, res) => {
-    const p = db();
-    if (!p) return res.json({ success: true, changes: [], noDatabase: true });
+    if (!db()) return res.json({ success: true, changes: [], noDatabase: true });
     try {
-      await ensureTables();
+      const p = await ensureTables();
       const r = await p.query(
         `SELECT id, object_type, object_id, object_name, action, title, before, after, status, error, done_by, done_at, undone_at, undone_by, undo_of
            FROM mk_changes WHERE tenant_id = $1 AND campaign_id = $2 ORDER BY done_at DESC LIMIT 100`,
@@ -535,10 +532,9 @@ export function registerOptimizerRoutes(app: express.Express) {
   });
 
   app.post('/api/meta-ads/changes/:id/undo', async (req, res) => {
-    const p = db();
-    if (!p) return res.json({ success: false, error: 'אין מסד נתונים' });
+    if (!db()) return res.json({ success: false, error: 'אין מסד נתונים' });
     try {
-      await ensureTables();
+      const p = await ensureTables();
       const creds = await adsCredsForCurrentBusiness();
       if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
       const r = await p.query(`SELECT * FROM mk_changes WHERE id = $1 AND tenant_id = $2`, [Number(req.params.id), currentTenant()]);

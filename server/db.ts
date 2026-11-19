@@ -5,23 +5,43 @@ import pg from 'pg';
 // must be kept (an approved change to a live campaign and how to undo it) is refused.
 let pool: pg.Pool | null = null;
 let ready: Promise<void> | null = null;
+// SSL first (managed Postgres), and without it when the server says it doesn't support SSL - the
+// shared self-hosted Postgres doesn't (same probe as the CRM's sslModeFor).
+let useSsl: boolean | null = null;
 
 export function db(): pg.Pool | null {
   const url = process.env.DATABASE_URL;
   if (!url) return null;
+  if (useSsl === null) useSsl = !/sslmode=disable|localhost|127\.0\.0\.1/.test(url);
   if (!pool) {
-    pool = new pg.Pool({
-      connectionString: url,
-      max: 3,
-      ssl: /sslmode=disable|localhost|127\.0\.0\.1/.test(url) ? undefined : { rejectUnauthorized: false },
-    });
+    pool = new pg.Pool({ connectionString: url, max: 3, ssl: useSsl ? { rejectUnauthorized: false } : false });
   }
   return pool;
 }
 
+async function resetWithoutSsl() {
+  const old = pool;
+  pool = null;
+  useSsl = false;
+  await old?.end().catch(() => {});
+}
+
+// The pool, with the tables created. Always use the pool this returns (it may have been rebuilt
+// without SSL).
 export async function ensureTables(): Promise<pg.Pool> {
-  const p = db();
-  if (!p) throw new Error('no-database');
+  if (!db()) throw new Error('no-database');
+  try {
+    await createTables();
+  } catch (e: any) {
+    if (!useSsl || !/does not support SSL/i.test(String(e?.message))) throw e;
+    await resetWithoutSsl();
+    await createTables();
+  }
+  return db()!;
+}
+
+function createTables(): Promise<void> {
+  const p = db()!;
   if (!ready) {
     ready = p.query(`
       CREATE TABLE IF NOT EXISTS mk_optimizations (
@@ -59,6 +79,5 @@ export async function ensureTables(): Promise<pg.Pool> {
       CREATE INDEX IF NOT EXISTS mk_changes_t ON mk_changes (tenant_id, campaign_id, done_at DESC);
     `).then(() => undefined).catch(e => { ready = null; throw e; });
   }
-  await ready;
-  return p;
+  return ready;
 }
