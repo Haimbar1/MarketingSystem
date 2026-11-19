@@ -143,6 +143,22 @@ async function crmOutcomes(body: any): Promise<any | null> {
   }
 }
 
+// The periods the CRM computes, in Israel calendar days, by MATURITY (Haim, 2026-11-19 - "we want to
+// know what a period's leads did; last week's leads haven't bought yet, so no ROAS for them"):
+//  last7  - the last 7 days (today included): leads / bookings only, too early for purchases;
+//  last30 - the last 30 days: purchases still coming in (partial ROAS);
+//  prev30 - 30-60 days ago: matured - the real ROAS.
+// The same days as the dashboard's "7 ימים" / "30 יום" presets.
+const israelToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+const shiftDay = (day: string, n: number) => new Date(Date.UTC(+day.slice(0, 4), +day.slice(5, 7) - 1, +day.slice(8, 10) + n)).toISOString().slice(0, 10);
+export function outcomePeriods(today = israelToday()) {
+  return [
+    { key: 'last7', since: shiftDay(today, -6), until: today, label: '7 הימים האחרונים', maturity: 'early' },
+    { key: 'last30', since: shiftDay(today, -29), until: today, label: '30 הימים האחרונים', maturity: 'partial' },
+    { key: 'prev30', since: shiftDay(today, -59), until: shiftDay(today, -30), label: 'לפני 30–60 יום', maturity: 'mature' },
+  ] as const;
+}
+
 // ILS for one unit of the ad account's currency (the optics bills in USD), to compare spend with CRM
 // revenue. null when it can't be read.
 async function ilsPerUnit(currency: string): Promise<number | null> {
@@ -172,17 +188,21 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     allPages(`${campaignId}/insights`, token, { level: 'campaign', date_preset: 'last_30d', breakdowns: 'age,gender', fields: 'spend,impressions,clicks,actions' }),
     allPages(`${accountId}/value_rule_set`, token, { fields: 'id,name,status' }),
   ]);
-  const allCampaigns = await allPages(`${accountId}/campaigns`, token, { fields: 'id,name' });
   const currency = account.data?.currency || '';
-  const [crm, ilsRate] = await Promise.all([
+  const periods = outcomePeriods();
+  const [crmRes, ilsRate] = await Promise.all([
     crmOutcomes({
       campaignId, campaignName: campaign.data?.name || '',
-      allCampaigns: allCampaigns.rows.map((c: any) => ({ id: String(c.id), name: String(c.name || '') })),
       adsets: adsets.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
       ads: ads.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
+      periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })),
     }),
     ilsPerUnit(currency),
   ]);
+  // each period: the CRM's numbers (computed exactly like its dashboard's ROI table) + label / maturity
+  const crm = Array.isArray(crmRes?.periods)
+    ? periods.map(p => ({ ...p, ...(crmRes.periods.find((x: any) => x.key === p.key) || {}) }))
+    : null;
   if (!campaign.ok) throw new Error(metaErr(campaign.data));
   if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) throw new Error('הקמפיין לא שייך לחשבון המודעות של העסק');
   const by = (rows: any[], key: string) => new Map(rows.map(r => [String(r[key]), r]));
@@ -210,12 +230,17 @@ type CampaignData = Awaited<ReturnType<typeof readCampaign>>;
 // What the AI sees: compact, amounts in the account's currency (major units).
 function forAi(d: CampaignData) {
   const minor = (v: any) => (v == null || v === '' ? null : round(num(v) / 100));
-  const crm = d.crm;
+  const crm: any[] | null = d.crm;
   return {
     currency: d.currency,
     ilsPerCurrencyUnit: d.ilsRate,
-    crm: crm
-      ? { note: 'CRM outcomes of this campaign\'s leads, by lead arrival day; revenue in ILS. Purchases come days-weeks after the lead, so the last 7 days are incomplete.', last7: crm.last7, last30: crm.last30, leadsWithUnknownAdset30: crm.unattributedAdset30 }
+    crmByPeriod: crm
+      ? crm.map((p: any) => ({
+          period: p.label, from: p.since, to: p.until, maturity: p.maturity,
+          spendIls: p.spendIls, metaLeads: p.fbLeads, crmLeads: p.leads, booked: p.booked, buyers: p.buyers, revenueIls: p.revenue,
+          roas: p.maturity === 'early' || !p.spendIls ? null : Math.round((p.revenue / p.spendIls) * 10) / 10,
+          leadsWithUnknownAdset: p.unattributedAdset,
+        }))
       : 'no CRM data for this business',
     campaign: {
       id: d.campaign.id, name: d.campaign.name, status: d.campaign.effective_status, objective: d.campaign.objective,
@@ -226,13 +251,13 @@ function forAi(d: CampaignData) {
       id: s.id, name: s.name, status: s.effective_status, configuredStatus: s.status, optimizationGoal: s.optimization_goal, bidStrategy: s.bid_strategy,
       dailyBudget: minor(s.daily_budget), learning: s.learning_stage_info?.status || null, valueRuleSet: s.value_rule_set_id || null,
       targeting: targetingSummary(s.targeting), last7: s.m7, last30: s.m30,
-      crm: crm?.byAdset?.[String(s.id)] || null,
+      crm: crm ? Object.fromEntries(crm.map((p: any) => [p.key, p.byAdset?.[String(s.id)] || null])) : null,
     })),
     ads: d.ads.map(a => ({
       id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, configuredStatus: a.status, created: a.created_time,
       kind: creativeKind(a.creative), text: String(a.creative?.body || a.creative?.asset_feed_spec?.bodies?.[0]?.text || '').slice(0, 220),
       last7: a.m7, last30: a.m30,
-      crm: crm?.byAd?.[String(a.id)] || null,
+      crm: crm ? Object.fromEntries(crm.map((p: any) => [p.key, p.byAd?.[String(a.id)] || null])) : null,
     })),
     last14DaysByDay: d.daily,
     placementsLast30: d.placements,
@@ -245,10 +270,10 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta (פייסב�
 קיבלת את הגדרות הקמפיין, סטי המודעות והמודעות, והתוצאות שלהם (7 ו-30 יום, 14 ימים אחרונים לפי יום, מיקומים, גיל ומגדר). הסכומים במטבע החשבון.
 המטרה: יותר לקוחות שקובעים תור וקונים, בעלות נמוכה יותר, בלי לשבור מה שעובד.
 
-נתוני ה-CRM (שדה crm - בקמפיין, בכל סט ובכל מודעה): כמה מהלידים קבעו תור (booked), כמה קנו (buyers) וכמה הכניסו (revenue, בשקלים). ההוצאה במטא היא במטבע החשבון; ilsPerCurrencyUnit = כמה שקלים ביחידת מטבע (ROAS = revenue / (spend × ilsPerCurrencyUnit)).
+נתוני ה-CRM (crmByPeriod, ובכל סט / מודעה שדה crm לפי תקופה): מה עשו הלידים שנכנסו בכל תקופה - קבעו תור (booked), קנו (buyers), הכניסו (revenueIls), מול ההוצאה של אותה תקופה בשקלים (spendIls) - בדיוק החישוב של דשבורד ה-CRM.
+- maturity: "early" = 7 הימים האחרונים - הלידים עוד לא הספיקו לקנות: לשפוט רק לידים ותורים, אין ROAS (roas = null) ואסור להסיק מהיעדר רכישות. "partial" = 30 הימים האחרונים - רכישות עוד מגיעות, ROAS חלקי. "mature" = לפני 30–60 יום - הלידים הבשילו: זה ה-ROAS האמיתי של הקמפיין.
 - כשיש נתוני CRM - הם קובעים יותר מהעלות לליד: סט/מודעה עם לידים יקרים יותר אבל יותר תורים ורכישות עדיף על לידים זולים שלא קובעים.
-- רכישות מגיעות ימים-שבועות אחרי הליד: ב-7 הימים האחרונים הן חלקיות - לשפוט רכישות לפי 30 יום, ותורים גם לפי 7.
-- אם crm חסר בסט/מודעה - ייתכן שהלידים לא שויכו (leadsWithUnknownAdset30); לא להסיק מזה שאין תוצאות.
+- אם crm חסר בסט/מודעה - ייתכן שהלידים לא שויכו (leadsWithUnknownAdset); לא להסיק מזה שאין תוצאות.
 - לציין בממצאים את העלות לתור ואת ה-ROAS כשאפשר.
 - בטקסטים (summary / findings / why / expected) לכתוב סכומים בשקלים בלבד (₪, אחרי המרה לפי ilsPerCurrencyUnit), לא בדולרים ולא "USD". רק ב-params.dailyBudget - המספר במטבע החשבון.
 
@@ -442,10 +467,10 @@ export function registerOptimizerRoutes(app: express.Express) {
         findings: (Array.isArray(parsed.findings) ? parsed.findings : []).map(String).slice(0, 8),
         currency: data.currency,
         totals: { last7: sumMetrics(data.adsets.map(s => s.m7)), last30: sumMetrics(data.adsets.map(s => s.m30)) },
-        crm: data.crm ? { last7: data.crm.last7, last30: data.crm.last30 } : null,
+        crmPeriods: data.crm ? data.crm.map((p: any) => ({ key: p.key, label: p.label, since: p.since, until: p.until, maturity: p.maturity, spendIls: p.spendIls, fbLeads: p.fbLeads, leads: p.leads ?? 0, booked: p.booked ?? 0, buyers: p.buyers ?? 0, revenue: p.revenue ?? 0 })) : null,
         ilsRate: data.ilsRate,
-        adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm?.byAdset?.[String(s.id)] || null })),
-        ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm?.byAd?.[String(a.id)] || null })),
+        adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAdset?.[String(s.id)] || null])) : null })),
+        ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAd?.[String(a.id)] || null])) : null })),
         daily: data.daily,
         readErrors: data.readErrors,
       };

@@ -11,11 +11,12 @@ type Suggestion = {
   before?: any; after?: any;
 };
 type Crm = { leads: number; booked: number; buyers: number; revenue: number };
-type CrmWin = { last7: Crm; last30: Crm } | null;
+type CrmWin = Record<string, Crm | null> | null; // by period key (last7 / last30 / prev30)
+type CrmPeriod = Crm & { key: string; label: string; since: string; until: string; maturity: 'early' | 'partial' | 'mature'; spendIls: number | null; fbLeads: number | null };
 type Analysis = {
   summary: string; health: 'good' | 'ok' | 'bad'; findings: string[]; currency: string;
   totals: { last7: any; last30: any };
-  crm?: CrmWin; ilsRate?: number | null;
+  crmPeriods?: CrmPeriod[] | null; ilsRate?: number | null;
   adsets: { id: string; name: string; status: string; learning: string | null; dailyBudget: number | null; m7: M; m30: M; crm?: CrmWin }[];
   ads: { id: string; adsetId: string; name: string; status: string; thumb: string | null; m7: M; m30: M; crm?: CrmWin }[];
   readErrors?: string[];
@@ -41,6 +42,8 @@ const ACTION_HE: Record<string, string> = {
 // The account's currency in Hebrew words (Haim, 2026-11-19 - "USD" in a Hebrew line read backwards).
 const CUR_HE: Record<string, string> = { USD: 'דולר', EUR: 'יורו', GBP: 'ליש"ט', ILS: 'ש"ח' };
 const curName = (cur: string) => CUR_HE[cur] || cur;
+const STATUS_HE: Record<string, string> = { ACTIVE: 'פעיל', PAUSED: 'מושהה', CAMPAIGN_PAUSED: 'הקמפיין מושהה', ADSET_PAUSED: 'הסט מושהה', ARCHIVED: 'בארכיון', WITH_ISSUES: 'עם בעיות', DISAPPROVED: 'נדחה', PENDING_REVIEW: 'בבדיקה', IN_PROCESS: 'בעיבוד' };
+const statusHe = (s: string) => STATUS_HE[s] || s;
 const fmt = (v: number | null | undefined, cur = '') => (v == null ? '—' : `${Number(v).toLocaleString('he-IL', { maximumFractionDigits: 2 })}${cur ? ` ${curName(cur)}` : ''}`);
 
 let RATE: number | null = null; // today's ILS rate of the account currency, set when an analysis loads
@@ -55,18 +58,17 @@ function describeChange(before: any, after: any, cur: string): string {
   return '';
 }
 
-// What the leads did in the CRM (30 days by arrival) + ROAS against the spend, in ILS.
-function CrmLine({ crm, spend, rate }: { crm?: CrmWin; spend?: number; rate?: number | null }) {
-  if (!crm) return null;
-  const c = crm.last30;
-  const spendIls = spend != null && rate ? spend * rate : null;
-  const roas = spendIls && spendIls > 0 ? (c.revenue / spendIls).toFixed(1) : null;
-  return (
-    <span className="text-emerald-800">
-      CRM 30 יום: {c.leads} לידים · {c.booked} קבעו תור · {c.buyers} קנו · ₪{Math.round(c.revenue).toLocaleString('he-IL')}
-      {roas ? ` · ROAS ${roas}x` : ''}
-    </span>
-  );
+// What an ad set's / ad's leads did in the CRM, per period (counts only - Meta doesn't split the CRM's
+// spend by ad set, so no ROAS here).
+function CrmLine({ crm, periods }: { crm?: CrmWin; periods?: CrmPeriod[] | null }) {
+  if (!crm || !periods) return null;
+  const parts = periods.map(p => {
+    const c = crm[p.key];
+    if (!c) return null;
+    return `${p.label}: ${c.leads} לידים · ${c.booked} תורים${p.maturity === 'early' ? '' : ` · ${c.buyers} קנו · ₪${Math.round(c.revenue).toLocaleString('he-IL')}`}`;
+  }).filter(Boolean);
+  if (!parts.length) return null;
+  return <span className="text-emerald-800">CRM - {parts.join(' | ')}</span>;
 }
 
 // Money in shekels (the account may bill in USD - converted at today's rate), with the original amount
@@ -77,35 +79,75 @@ function ils(v: number | null | undefined, rate: number | null | undefined, cur:
   return `₪${Math.round(v * rate).toLocaleString('he-IL')}`;
 }
 
-// "7 / 30 ימים" as a table, every number labelled (Haim, 2026-11-19 - "279.86 USD · 49 לידים" wasn't clear).
+// The campaign by period, every number labelled (Haim, 2026-11-19). With the CRM: what the leads that
+// came in during each period did - computed by the CRM exactly like its dashboard's ROI table (same
+// leads, same spend in shekels) - and the ROAS only where it can be known: last week's leads haven't
+// bought yet, the last 30 days are still coming in, 30-60 days ago is the real one.
 function SummaryTable({ a }: { a: Analysis }) {
   const cur = a.currency, rate = a.ilsRate;
-  const rows = [
-    { label: '7 ימים אחרונים', m: a.totals.last7, crm: a.crm?.last7 },
-    { label: '30 ימים אחרונים', m: a.totals.last30, crm: a.crm?.last30 },
-  ];
-  const per = (spend: number, n: number) => (n > 0 ? ils(spend / n, rate, cur) : '—');
-  const roas = (rev: number, spend: number) => (rate && spend > 0 ? `${(rev / (spend * rate)).toFixed(1)}x` : '—');
+  const shekel = (v: number | null | undefined) => (v == null ? '—' : `₪${Math.round(v).toLocaleString('he-IL')}`);
+  const per = (spend: number | null, n: number) => (spend != null && n > 0 ? shekel(spend / n) : '—');
   const th = 'px-2 py-1.5 font-bold text-gray-600 text-right whitespace-nowrap';
   const td = 'px-2 py-1.5 text-gray-800 whitespace-nowrap';
-  return (
-    <div className="overflow-x-auto">
-      <table className="text-xs w-full border border-gray-200 rounded-lg">
-        <thead className="bg-gray-50">
-          <tr>
-            <th className={th}></th>
-            <th className={th} title="כמה הוצא על הקמפיין במטא">הוצאה</th>
-            <th className={th} title="לידים שמטא ספרה (טפסים שמולאו)">לידים במטא</th>
-            <th className={th}>עלות לליד</th>
-            {a.crm && <>
+  if (a.crmPeriods?.length) {
+    const roasCell = (p: CrmPeriod) => {
+      if (p.maturity === 'early') return <span className="text-gray-400" title="הלידים של השבוע האחרון עוד לא הספיקו לקנות">מוקדם מדי לדעת</span>;
+      if (!p.spendIls) return '—';
+      const r = `${(p.revenue / p.spendIls).toFixed(1)}x`;
+      return p.maturity === 'partial' ? <span title="רכישות של הלידים האלה עוד מגיעות">{r} <span className="text-gray-400">(עוד מבשיל)</span></span> : <b>{r}</b>;
+    };
+    const dd = (d: string) => `${d.slice(8, 10)}/${d.slice(5, 7)}`;
+    return (
+      <div className="overflow-x-auto">
+        <table className="text-xs w-full border border-gray-200 rounded-lg">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className={th}>הלידים שנכנסו ב…</th>
+              <th className={th} title="ההוצאה על הקמפיין בתקופה, בשקלים - כמו בדשבורד של ה-CRM">הוצאה</th>
+              <th className={th} title="לידים שמטא ספרה (טפסים שמולאו)">לידים במטא</th>
               <th className={`${th} bg-emerald-50`} title="לידים של הקמפיין שנכנסו ל-CRM בתקופה">לידים ב-CRM</th>
+              <th className={`${th} bg-emerald-50`}>עלות לליד</th>
               <th className={`${th} bg-emerald-50`}>קבעו תור</th>
               <th className={`${th} bg-emerald-50`}>עלות לתור</th>
               <th className={`${th} bg-emerald-50`}>קנו</th>
               <th className={`${th} bg-emerald-50`}>הכנסה</th>
               <th className={`${th} bg-emerald-50`} title="הכנסה חלקי הוצאה">החזר (ROAS)</th>
-            </>}
-          </tr>
+            </tr>
+          </thead>
+          <tbody>
+            {a.crmPeriods.map(p => (
+              <tr key={p.key} className={`border-t border-gray-100 ${p.maturity === 'mature' ? 'bg-emerald-50/40' : ''}`}>
+                <td className={`${td} font-bold`}>{p.label} <span className="font-normal text-gray-400">({dd(p.since)} עד {dd(p.until)})</span></td>
+                <td className={td}>{shekel(p.spendIls)}</td>
+                <td className={td}>{p.fbLeads ?? '—'}</td>
+                <td className={td}>{p.leads}</td>
+                <td className={td}>{per(p.spendIls, p.leads)}</td>
+                <td className={td}>{p.booked}</td>
+                <td className={td}>{per(p.spendIls, p.booked)}</td>
+                <td className={td}>{p.maturity === 'early' ? <span className="text-gray-400">{p.buyers}</span> : p.buyers}</td>
+                <td className={td}>{p.maturity === 'early' ? <span className="text-gray-400">{shekel(p.revenue)}</span> : shekel(p.revenue)}</td>
+                <td className={td}>{roasCell(p)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p className="text-[10px] text-gray-400 mt-1">
+          החישוב זהה לטבלת "החזר השקעה מפייסבוק" בדשבורד של ה-CRM לאותם ימים: הלידים לפי יום הכניסה שלהם, הרכישות שלהם מאז, וההוצאה בשקלים לפי שער כל יום.
+          לידים של השבוע האחרון עוד לא הספיקו לקנות - לכן אין להם החזר; ההחזר האמיתי הוא של הלידים מלפני 30–60 יום.
+        </p>
+      </div>
+    );
+  }
+  // no CRM: Meta's own numbers
+  const rows = [
+    { label: '7 ימים אחרונים', m: a.totals.last7 },
+    { label: '30 ימים אחרונים', m: a.totals.last30 },
+  ];
+  return (
+    <div className="overflow-x-auto">
+      <table className="text-xs w-full border border-gray-200 rounded-lg">
+        <thead className="bg-gray-50">
+          <tr><th className={th}></th><th className={th}>הוצאה</th><th className={th}>לידים במטא</th><th className={th}>עלות לליד</th></tr>
         </thead>
         <tbody>
           {rows.map(r => (
@@ -113,23 +155,12 @@ function SummaryTable({ a }: { a: Analysis }) {
               <td className={`${td} font-bold`}>{r.label}</td>
               <td className={td} title={cur !== 'ILS' ? fmt(r.m.spend, cur) : undefined}>{ils(r.m.spend, rate, cur)}</td>
               <td className={td}>{r.m.leads}</td>
-              <td className={td}>{per(r.m.spend, r.m.leads)}</td>
-              {a.crm && r.crm && <>
-                <td className={td}>{r.crm.leads}</td>
-                <td className={td}>{r.crm.booked}</td>
-                <td className={td}>{per(r.m.spend, r.crm.booked)}</td>
-                <td className={td}>{r.crm.buyers}</td>
-                <td className={td}>₪{Math.round(r.crm.revenue).toLocaleString('he-IL')}</td>
-                <td className={td}>{roas(r.crm.revenue, r.m.spend)}</td>
-              </>}
+              <td className={td}>{r.m.leads ? ils(r.m.spend / r.m.leads, rate, cur) : '—'}</td>
             </tr>
           ))}
         </tbody>
       </table>
-      <p className="text-[10px] text-gray-400 mt-1">
-        {cur !== 'ILS' && rate ? `ההוצאה במטא היא ב${curName(cur)}, הומרה לשקלים לפי שער היום (${rate.toFixed(2)}). ` : ''}
-        {a.crm ? 'לידים / תורים / רכישות לפי יום כניסת הליד ל-CRM; רכישות מגיעות לרוב ימים-שבועות אחרי הליד, ולכן ב-7 הימים האחרונים הן חלקיות.' : ''}
-      </p>
+      {cur !== 'ILS' && rate ? <p className="text-[10px] text-gray-400 mt-1">ההוצאה במטא היא ב{curName(cur)}, הומרה לשקלים לפי שער היום ({rate.toFixed(2)}).</p> : null}
     </div>
   );
 }
@@ -243,7 +274,7 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                 </div>
                 <p className="text-sm text-gray-800">{analysis.summary}</p>
                 <SummaryTable a={analysis} />
-                {!analysis.crm && (
+                {!analysis.crmPeriods && (
                   <p className="text-[11px] text-gray-500">אין נתוני CRM לקמפיין הזה (אין CRM לעסק, או שהלידים לא שויכו לקמפיין) - הניתוח לפי נתוני מטא בלבד.</p>
                 )}
                 {analysis.findings.length > 0 && (
@@ -257,15 +288,15 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                 <div className="mt-2 space-y-2">
                   {analysis.adsets.map(s => (
                     <div key={s.id} className="bg-gray-50 rounded-lg p-2">
-                      <div className="font-bold text-gray-800">{s.name} <span className="font-normal text-gray-500">· {s.status}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}</span></div>
+                      <div className="font-bold text-gray-800">{s.name} <span className="font-normal text-gray-500">· {statusHe(s.status)}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}</span></div>
                       <div className="text-gray-600">7 ימים אחרונים: <MetricsCell m={s.m7} cur={cur} rate={analysis.ilsRate} /> · 30 ימים אחרונים: <MetricsCell m={s.m30} cur={cur} rate={analysis.ilsRate} /></div>
-                      {s.crm && <div><CrmLine crm={s.crm} spend={s.m30?.spend} rate={analysis.ilsRate} /></div>}
+                      {s.crm && <div><CrmLine crm={s.crm} periods={analysis.crmPeriods} /></div>}
                       {analysis.ads.filter(a => a.adsetId === s.id).map(a => (
                         <div key={a.id} className="flex items-center gap-2 mt-1 pr-3">
                           {a.thumb && <img src={a.thumb} alt="" className="w-7 h-7 rounded object-cover" loading="lazy" />}
                           <span className="text-gray-700 truncate">{a.name}</span>
                           <span className="text-gray-500 shrink-0">· 7 ימים אחרונים: <MetricsCell m={a.m7} cur={cur} rate={analysis.ilsRate} /></span>
-                          {a.crm && <span className="shrink-0">· <CrmLine crm={a.crm} spend={a.m30?.spend} rate={analysis.ilsRate} /></span>}
+                          {a.crm && <span className="shrink-0">· <CrmLine crm={a.crm} periods={analysis.crmPeriods} /></span>}
                         </div>
                       ))}
                     </div>
