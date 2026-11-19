@@ -3,6 +3,7 @@
 // Every change is listed below with "↩ בטל". Server: server/campaignOptimizer.ts.
 import React, { useEffect, useState } from 'react';
 import { X, Loader2, RefreshCw, CheckCircle2, AlertTriangle, Undo2 } from 'lucide-react';
+import WeeklyTrend, { Week } from './WeeklyTrend';
 
 type M = { spend: number; leads: number; cpl: number | null; ctr?: number | null; frequency?: number; impressions?: number } | null;
 type Suggestion = {
@@ -19,7 +20,7 @@ type CrmPeriod = Crm & {
 type Analysis = {
   summary: string; health: 'good' | 'ok' | 'bad'; findings: string[]; currency: string;
   totals: { last7: any; last30: any };
-  crmPeriods?: CrmPeriod[] | null; ilsRate?: number | null;
+  crmPeriods?: CrmPeriod[] | null; ilsRate?: number | null; crmWeeks?: Week[] | null;
   adsets: { id: string; name: string; status: string; learning: string | null; dailyBudget: number | null; m7: M; m30: M; crm?: CrmWin }[];
   ads: { id: string; adsetId: string; name: string; status: string; thumb: string | null; m7: M; m30: M; crm?: CrmWin }[];
   readErrors?: string[];
@@ -285,6 +286,7 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                 </div>
                 <p className="text-sm text-gray-800">{analysis.summary}</p>
                 <SummaryTable a={analysis} />
+                {analysis.crmWeeks?.length ? <WeeklyTrend weeks={analysis.crmWeeks} /> : null}
                 {!analysis.crmPeriods && (
                   <p className="text-[11px] text-gray-500">אין נתוני CRM לקמפיין הזה (אין CRM לעסק, או שהלידים לא שויכו לקמפיין) - הניתוח לפי נתוני מטא בלבד.</p>
                 )}

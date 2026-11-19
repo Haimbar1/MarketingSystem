@@ -159,6 +159,16 @@ export function outcomePeriods(today = israelToday()) {
   ] as const;
 }
 
+// The chart's weeks: 9 periods of 7 Israel days ending today (~60 days), oldest first, each with its
+// maturity like the table's periods.
+export function outcomeWeeks(today = israelToday()) {
+  return Array.from({ length: 9 }, (_, i) => {
+    const back = 8 - i;
+    const until = shiftDay(today, -7 * back), since = shiftDay(until, -6);
+    return { key: `w${i}`, since, until, maturity: back === 0 ? 'early' : back <= 3 ? 'partial' : 'mature' };
+  });
+}
+
 // ILS for one unit of the ad account's currency (the optics bills in USD), to compare spend with CRM
 // revenue. null when it can't be read.
 async function ilsPerUnit(currency: string): Promise<number | null> {
@@ -190,12 +200,13 @@ export async function readCampaign(creds: Creds, campaignId: string) {
   ]);
   const currency = account.data?.currency || '';
   const periods = outcomePeriods();
+  const weeks = outcomeWeeks();
   const [crmRes, ilsRate] = await Promise.all([
     crmOutcomes({
       campaignId, campaignName: campaign.data?.name || '',
       adsets: adsets.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
       ads: ads.rows.map((x: any) => ({ id: String(x.id), name: String(x.name || '') })),
-      periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })),
+      periods: [...periods, ...weeks].map(p => ({ key: p.key, since: p.since, until: p.until })),
     }),
     ilsPerUnit(currency),
   ]);
@@ -217,6 +228,14 @@ export async function readCampaign(creds: Creds, campaignId: string) {
         };
       })
     : null;
+  // the weekly chart: the same bottom line per week (all Meta leads, the account's spend)
+  const crmWeeks = Array.isArray(crmRes?.periods)
+    ? weeks.map(w => {
+        const r: any = crmRes.periods.find((x: any) => x.key === w.key) || {};
+        const t = r.total;
+        return { ...w, spendIls: t?.spendIls ?? null, leads: t?.leads ?? 0, booked: t?.booked ?? 0, buyers: t?.buyers ?? 0, revenue: t?.revenue ?? 0 };
+      })
+    : null;
   if (!campaign.ok) throw new Error(metaErr(campaign.data));
   if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) throw new Error('הקמפיין לא שייך לחשבון המודעות של העסק');
   const by = (rows: any[], key: string) => new Map(rows.map(r => [String(r[key]), r]));
@@ -226,6 +245,7 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     currency,
     ilsRate,
     crm,
+    crmWeeks,
     timezone: account.data?.timezone_name || '',
     minDailyBudget: num(account.data?.min_daily_budget),
     campaign: campaign.data,
@@ -486,6 +506,7 @@ export function registerOptimizerRoutes(app: express.Express) {
         totals: { last7: sumMetrics(data.adsets.map(s => s.m7)), last30: sumMetrics(data.adsets.map(s => s.m30)) },
         crmPeriods: data.crm ? data.crm.map((p: any) => ({ key: p.key, label: p.label, since: p.since, until: p.until, maturity: p.maturity, spendIls: p.spendIls, fbLeads: p.fbLeads, leads: p.leads ?? 0, booked: p.booked ?? 0, buyers: p.buyers ?? 0, revenue: p.revenue ?? 0, campaignSpendIls: p.campaignSpendIls ?? null, campaignsWithSpend: p.campaignsWithSpend ?? null })) : null,
         ilsRate: data.ilsRate,
+        crmWeeks: data.crmWeeks,
         adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAdset?.[String(s.id)] || null])) : null })),
         ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAd?.[String(a.id)] || null])) : null })),
         daily: data.daily,
