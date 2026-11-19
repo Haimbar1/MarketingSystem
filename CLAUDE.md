@@ -17,16 +17,16 @@ Haim is non-technical and tests live — no staging. Push carefully.
 - Approval: in this app (phone / web) or through נועם on WhatsApp. New campaigns are uploaded **PAUSED**; going live is a separate tap.
 - Events back to Meta stay where they are: the landing page pixel, and the CRM's Conversions API (Schedule = booked exam, Purchase) — see the CRM's `server/metaCapi.ts`.
 - Reports: like the CRM's FB ROI dashboard, plus what's needed.
-- **The pilot changes nothing in the optics' running campaigns** — optimisation is read / suggest only until Haim decides what the AI may do alone.
+- **Nothing changes in a running campaign without a person's approval** — the AI suggests, the person ticks and confirms each change (step 2). Nothing is done automatically until Haim decides what the AI may do alone.
 - Ad set settings the builder must handle: audience (age, gender, places + radius, interests, custom / lookalike audiences included / excluded, Advantage+ audience), **placement value rules** (Haim's rule set "+50% on feed FB / Instagram reel": `act_…/value_rule_set`, attached with `value_rule_set_id` + `value_rules_applied`; an ad set can't have both value rules and bid multipliers), budgets / bid strategy, optimisation goal, attribution, frequency. New campaigns start as a copy of a proven one's settings ("like the 150 campaign, for Haifa").
 - Lookalikes: the CRM already exports buyers / non-buyers (`GET /api/meta-audience`); here they'll be uploaded as a custom audience (hashed) and a lookalike made from it (needs the Custom Audience terms accepted on the ad account).
 
 ## Plan
 
 1. ✅ Read-only snapshot of the ad account — "📣 ממומן" (`server/metaAdsSnapshot.ts`, `src/components/AdsSnapshotView.tsx`, `GET /api/meta-ads/snapshot`). Also in WhastAppSystem's posts screen until this app is live.
-2. AI campaign draft from an instruction (copying a proven campaign's settings) → approval → uploaded PAUSED.
-3. CRM buyers → custom audience → lookalike, refreshed.
-4. Optimisation suggestions (no automatic changes in the pilot).
+2. ✅ **Maintaining a running campaign** (Haim, 2026-11-19 — "before a new campaign, maintain an existing one: analyse, suggest changes, approve and execute"; `server/campaignOptimizer.ts`, `src/components/CampaignOptimizer.tsx`, "🔧 ניתוח והצעות לשיפור" on each campaign in "📣 ממומן"). `POST /api/meta-ads/campaigns/:id/analyze` reads the campaign, ad sets, ads, their 7 / 30-day results, 14 days by day, placements and age × gender, and Gemini (`server/ai.ts`, the business's key else the platform's; every call reported to the CRM's `/api/ai-usage/ingest` as app `marketing`) returns a summary, findings and suggestions. **Each suggestion is checked in code** (`validate`): only `pause_ad` / `activate_ad` / `pause_adset` / `activate_adset` / `set_adset_daily_budget` / `set_campaign_daily_budget` / `set_adset_age` / `apply_value_rule_set` can be executed — anything else is advice ("manual"); a budget change is capped at ±50% of the current one and never under the account's minimum; the last active ad of an ad set / the last active ad set is never paused; age 18–65 (≤25 minimum with Advantage+ audience); value rules not on an ad set with bid multipliers. Stored with each target's value at the time (`mk_optimizations`). `POST /api/meta-ads/optimizations/:id/execute` runs only what the person ticked and confirmed (a budget can be edited, same ±50% limit), within 24h of the analysis; **each target is read again and skipped if it changed in Meta since**; every change goes to `mk_changes` (before / after / who / Meta's error). `POST /api/meta-ads/changes/:id/undo` writes "before" back (only if the value is still what we set; once). Executing needs DATABASE_URL — without it the analysis works and execution is refused. Tested end to end with a mocked Graph / Gemini on PGlite.
+3. AI campaign draft from an instruction (copying a proven campaign's settings) → approval → uploaded PAUSED.
+4. CRM buyers → custom audience → lookalike, refreshed. Also: CRM outcomes per campaign (booked / bought / revenue — the CRM's ROI data) in the analysis, so it optimises on purchases, not only leads.
 5. Organic posts move here from WhastAppSystem (its `facebook-posts` routes, `FacebookPostView.tsx`, the video maker…), gradually; the old screen stays there until the new one works.
 
 ## How it's built
@@ -36,5 +36,5 @@ Haim is non-technical and tests live — no staging. Push carefully.
 - Per request business: `server/tenant.ts` (AsyncLocalStorage). Portal tenant id = this app's business id.
 - Keys: the portal vault as module `marketing` (`server/secrets.ts`, `tenantSecret`); the catalog (`portal/server/src/secrets/catalog.js`) lists which keys go to `marketing` (today FB_ADS_ACCESS_TOKEN, FB_AD_ACCOUNT_ID, FB_PAGE_ID, FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY). The optics may fall back to this app's Vercel env. Add new per-business keys to that catalog, not as Vercel env vars.
 - Meta Graph v21.0. Meta keeps retiring fields and one unknown field fails a whole request — `readEdge` drops a field Meta says doesn't exist and retries.
-- No database yet. Drafts / approvals (step 2) will need one: `DATABASE_URL` (Postgres, `pg`), tables created lazily, per business.
+- Database: `DATABASE_URL` (Postgres, `pg`, `server/db.ts`), tables `mk_*` created lazily, per business (`tenant_id`). Without it, reading works and anything that changes Meta is refused.
 - Never point local tests at real Meta write endpoints — a create call spends the business's money once the campaign is active.

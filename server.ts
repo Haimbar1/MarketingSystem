@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { SESSION_HEADER, sessionFromPortalToken, verifySession } from './server/session.js';
 import { runWithTenant } from './server/tenant.js';
 import { registerAdsSnapshotRoutes } from './server/metaAdsSnapshot.js';
+import { registerOptimizerRoutes } from './server/campaignOptimizer.js';
 
 const requestHost = (req: express.Request) =>
   String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
@@ -45,6 +46,8 @@ export async function createApp({ serveFrontend }: { serveFrontend: boolean }) {
 
   // Paid campaigns, step 1: read-only snapshot of the Meta ad account.
   registerAdsSnapshotRoutes(app);
+  // Maintaining a running campaign: analyse → suggestions → approve → execute / undo.
+  registerOptimizerRoutes(app);
 
   app.use('/api', (_req, res) => res.status(404).json({ success: false, error: 'not-found' }));
 

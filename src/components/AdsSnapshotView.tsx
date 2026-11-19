@@ -4,6 +4,7 @@
 // Data: GET /api/meta-ads/snapshot (server/metaAdsSnapshot.ts). Nothing here changes anything at Meta.
 import React, { useEffect, useMemo, useState } from 'react';
 import { Loader2, RefreshCw, Download, ChevronDown, ChevronLeft } from 'lucide-react';
+import CampaignOptimizer from './CampaignOptimizer';
 
 type Part = { ok: boolean; data: any[]; error?: string; droppedFields?: string[] };
 type Snapshot = {
@@ -165,6 +166,7 @@ export default function AdsSnapshotView() {
   const [tab, setTab] = useState<Tab>('structure');
   const [showAll, setShowAll] = useState(false);
   const [open, setOpen] = useState<Record<string, boolean>>({});
+  const [optimizeFor, setOptimizeFor] = useState<{ id: string; name: string } | null>(null);
 
   const load = async () => {
     setLoading(true); setError('');
@@ -276,6 +278,12 @@ export default function AdsSnapshotView() {
                         </div>
                       </div>
                     </button>
+                    <div className="px-3 pb-2 -mt-1">
+                      <button onClick={() => setOptimizeFor({ id: String(c.id), name: c.name })}
+                        className="text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg px-3 py-1.5">
+                        🔧 ניתוח והצעות לשיפור
+                      </button>
+                    </div>
                     {isOpen && (
                       <div className="px-3 pb-3 space-y-2">
                         {sets.map(s => {
@@ -426,6 +434,7 @@ export default function AdsSnapshotView() {
           )}
         </div>
       </div>
+      {optimizeFor && <CampaignOptimizer campaign={optimizeFor} onClose={() => setOptimizeFor(null)} />}
     </div>
   );
 }
