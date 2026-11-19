@@ -14,8 +14,7 @@ type Crm = { leads: number; booked: number; buyers: number; revenue: number };
 type CrmWin = Record<string, Crm | null> | null; // by period key (last7 / last30 / prev30)
 type CrmPeriod = Crm & {
   key: string; label: string; since: string; until: string; maturity: 'early' | 'partial' | 'mature'; spendIls: number | null; fbLeads: number | null;
-  onlyCampaign?: boolean; withoutCampaign?: number; // the only campaign that spent: = the dashboard's bottom line, incl. Meta leads with no campaign
-  dashboardTotal?: (Crm & { spendIls: number; campaigns: number }) | null; // several campaigns spent: the dashboard's bottom line, for reference
+  campaignSpendIls?: number | null; campaignsWithSpend?: number | null; // this campaign's own spend / how many campaigns ran
 };
 type Analysis = {
   summary: string; health: 'good' | 'ok' | 'bad'; findings: string[]; currency: string;
@@ -106,10 +105,10 @@ function SummaryTable({ a }: { a: Analysis }) {
         <table className="text-xs w-full border border-gray-200 rounded-lg">
           <thead className="bg-gray-50">
             <tr>
-              <th className={th}>הלידים שנכנסו ב…</th>
-              <th className={th} title="ההוצאה על הקמפיין בתקופה, בשקלים - כמו בדשבורד של ה-CRM">הוצאה</th>
+              <th className={th}>לידי Meta שנכנסו ב…</th>
+              <th className={th} title="ההוצאה של כל הקמפיינים בחשבון בתקופה, בשקלים - כמו בדשבורד של ה-CRM">הוצאה</th>
               <th className={th} title="לידים שמטא ספרה (טפסים שמולאו)">לידים במטא</th>
-              <th className={`${th} bg-emerald-50`} title="לידים של הקמפיין שנכנסו ל-CRM בתקופה">לידים ב-CRM</th>
+              <th className={`${th} bg-emerald-50`} title="כל לידי Meta שנכנסו ל-CRM בתקופה">לידים ב-CRM</th>
               <th className={`${th} bg-emerald-50`}>עלות לליד</th>
               <th className={`${th} bg-emerald-50`}>קבעו תור</th>
               <th className={`${th} bg-emerald-50`}>עלות לתור</th>
@@ -132,10 +131,10 @@ function SummaryTable({ a }: { a: Analysis }) {
                 <td className={td}>{p.maturity === 'early' ? <span className="text-gray-400">{shekel(p.revenue)}</span> : shekel(p.revenue)}</td>
                 <td className={td}>{roasCell(p)}</td>
               </tr>
-              {p.dashboardTotal && (
+              {p.campaignsWithSpend != null && p.campaignsWithSpend > 1 && (
                 <tr className="text-gray-500">
                   <td className="px-2 pb-1.5 text-[10px] whitespace-nowrap" colSpan={10}>
-                    בדשבורד ה-CRM לאותם ימים (כל {p.dashboardTotal.campaigns} הקמפיינים + לידי Meta בלי קמפיין): הוצאה {shekel(p.dashboardTotal.spendIls)} · {p.dashboardTotal.leads} לידים · {p.dashboardTotal.booked} קבעו תור · {p.dashboardTotal.buyers} קנו · {shekel(p.dashboardTotal.revenue)}
+                    בתקופה הזו רצו {p.campaignsWithSpend} קמפיינים - ההוצאה של הקמפיין הזה: {shekel(p.campaignSpendIls)} מתוך {shekel(p.spendIls)}
                   </td>
                 </tr>
               )}
@@ -145,7 +144,7 @@ function SummaryTable({ a }: { a: Analysis }) {
         <p className="text-[10px] text-gray-400 mt-1">
           החישוב זהה לטבלת "החזר השקעה מפייסבוק" בדשבורד של ה-CRM לאותם ימים: הלידים לפי יום הכניסה שלהם, הרכישות שלהם מאז, וההוצאה בשקלים לפי שער כל יום.
           לידים של השבוע האחרון עוד לא הספיקו לקנות - לכן אין להם החזר; ההחזר האמיתי הוא של הלידים מלפני 30–60 יום.
-          {a.crmPeriods.some(p => p.onlyCampaign && p.withoutCampaign) ? ` בתקופות שבהן זה הקמפיין היחיד שרץ, נספרים גם לידי Meta שאין להם שם קמפיין ב-CRM (${a.crmPeriods.filter(p => p.onlyCampaign).map(p => `${p.label}: ${p.withoutCampaign}`).join(', ')}) - כמו בשורה התחתונה של הדשבורד.` : ''}
+          כל לידי Meta של התקופה (לפי המקור, בלי קשר לשם הקמפיין) מול ההוצאה של כל הקמפיינים בחשבון - בדיוק השורה התחתונה של הדשבורד.
         </p>
       </div>
     );

@@ -199,23 +199,21 @@ export async function readCampaign(creds: Creds, campaignId: string) {
     }),
     ilsPerUnit(currency),
   ]);
-  // each period: the CRM's numbers (computed exactly like its dashboard's ROI table) + label / maturity.
-  // When this campaign is the only one that spent in the period, the dashboard's bottom line IS this
-  // campaign - including the Meta leads with no campaign name (older leads n8n sent without one; Haim,
-  // 2026-11-19: the analysis showed 58 leads where the dashboard showed 163). Those numbers are used.
+  // each period: the CRM dashboard's bottom line for the same days - every Meta lead of the period
+  // (by source, whatever its campaign name) and the whole account's spend, computed by the CRM exactly
+  // like its ROI table (Haim, 2026-11-19: "don't match by campaign name - I may have renamed it; Meta
+  // leads"). This campaign's own spend goes alongside; per ad set / ad stays by name where known.
   const crm = Array.isArray(crmRes?.periods)
     ? periods.map(p => {
         const r: any = crmRes.periods.find((x: any) => x.key === p.key) || {};
         const t = r.total;
-        const alone = !!t && t.campaignsWithSpend <= 1 && Math.abs((r.spendIls || 0) - t.spendIls) < 0.01;
-        const nums = alone
-          ? { spendIls: t.spendIls, fbLeads: t.fbLeads, leads: t.leads, booked: t.booked, buyers: t.buyers, revenue: t.revenue }
-          : { spendIls: r.spendIls ?? null, fbLeads: r.fbLeads ?? null, leads: r.leads ?? 0, booked: r.booked ?? 0, buyers: r.buyers ?? 0, revenue: r.revenue ?? 0 };
         return {
-          ...p, ...r, ...nums,
-          onlyCampaign: alone,
-          withoutCampaign: alone ? t.unassignedMeta?.leads || 0 : 0,
-          dashboardTotal: !alone && t ? { spendIls: t.spendIls, leads: t.leads, booked: t.booked, buyers: t.buyers, revenue: t.revenue, campaigns: t.campaignsWithSpend } : null,
+          ...p, ...r,
+          spendIls: t ? t.spendIls : r.spendIls ?? null,
+          fbLeads: t ? t.fbLeads : r.fbLeads ?? null,
+          leads: t ? t.leads : 0, booked: t ? t.booked : 0, buyers: t ? t.buyers : 0, revenue: t ? t.revenue : 0,
+          campaignSpendIls: r.spendIls ?? null,
+          campaignsWithSpend: t?.campaignsWithSpend ?? null,
         };
       })
     : null;
@@ -256,10 +254,9 @@ function forAi(d: CampaignData) {
           spendIls: p.spendIls, metaLeads: p.fbLeads, crmLeads: p.leads, booked: p.booked, buyers: p.buyers, revenueIls: p.revenue,
           roas: p.maturity === 'early' || !p.spendIls ? null : Math.round((p.revenue / p.spendIls) * 10) / 10,
           leadsWithUnknownAdset: p.unattributedAdset,
-          note: p.onlyCampaign
-            ? `the only campaign with spend in this period - numbers include ${p.withoutCampaign} Meta leads that have no campaign name in the CRM (same as the CRM dashboard)`
-            : 'leads tied to this campaign by name only',
-          accountTotalLikeDashboard: p.dashboardTotal,
+          note: `account level, like the CRM dashboard: all Meta leads of the period and the spend of all ${p.campaignsWithSpend ?? '?'} campaigns that ran; this campaign's own spend: ${p.campaignSpendIls ?? '?'} ILS`,
+          thisCampaignSpendIls: p.campaignSpendIls,
+          campaignsThatRan: p.campaignsWithSpend,
         }))
       : 'no CRM data for this business',
     campaign: {
@@ -290,7 +287,7 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta (פייסב�
 קיבלת את הגדרות הקמפיין, סטי המודעות והמודעות, והתוצאות שלהם (7 ו-30 יום, 14 ימים אחרונים לפי יום, מיקומים, גיל ומגדר). הסכומים במטבע החשבון.
 המטרה: יותר לקוחות שקובעים תור וקונים, בעלות נמוכה יותר, בלי לשבור מה שעובד.
 
-נתוני ה-CRM (crmByPeriod, ובכל סט / מודעה שדה crm לפי תקופה): מה עשו הלידים שנכנסו בכל תקופה - קבעו תור (booked), קנו (buyers), הכניסו (revenueIls), מול ההוצאה של אותה תקופה בשקלים (spendIls) - בדיוק החישוב של דשבורד ה-CRM.
+נתוני ה-CRM (crmByPeriod): מה עשו כל לידי Meta שנכנסו בכל תקופה - קבעו תור (booked), קנו (buyers), הכניסו (revenueIls), מול ההוצאה של כל החשבון באותה תקופה בשקלים (spendIls) - בדיוק השורה התחתונה של דשבורד ה-CRM (ברמת החשבון, לא לפי שם קמפיין; ההוצאה של הקמפיין הזה ב-thisCampaignSpendIls). בכל סט / מודעה שדה crm - רק לידים שיודעים לשייך לפי שם הסט / המודעה, ולכן חלקי.
 - maturity: "early" = 7 הימים האחרונים - הלידים עוד לא הספיקו לקנות: לשפוט רק לידים ותורים, אין ROAS (roas = null) ואסור להסיק מהיעדר רכישות. "partial" = 30 הימים האחרונים - רכישות עוד מגיעות, ROAS חלקי. "mature" = לפני 30–60 יום - הלידים הבשילו: זה ה-ROAS האמיתי של הקמפיין.
 - כשיש נתוני CRM - הם קובעים יותר מהעלות לליד: סט/מודעה עם לידים יקרים יותר אבל יותר תורים ורכישות עדיף על לידים זולים שלא קובעים.
 - אם crm חסר בסט/מודעה - ייתכן שהלידים לא שויכו (leadsWithUnknownAdset); לא להסיק מזה שאין תוצאות.
@@ -487,7 +484,7 @@ export function registerOptimizerRoutes(app: express.Express) {
         findings: (Array.isArray(parsed.findings) ? parsed.findings : []).map(String).slice(0, 8),
         currency: data.currency,
         totals: { last7: sumMetrics(data.adsets.map(s => s.m7)), last30: sumMetrics(data.adsets.map(s => s.m30)) },
-        crmPeriods: data.crm ? data.crm.map((p: any) => ({ key: p.key, label: p.label, since: p.since, until: p.until, maturity: p.maturity, spendIls: p.spendIls, fbLeads: p.fbLeads, leads: p.leads ?? 0, booked: p.booked ?? 0, buyers: p.buyers ?? 0, revenue: p.revenue ?? 0, onlyCampaign: !!p.onlyCampaign, withoutCampaign: p.withoutCampaign || 0, dashboardTotal: p.dashboardTotal || null })) : null,
+        crmPeriods: data.crm ? data.crm.map((p: any) => ({ key: p.key, label: p.label, since: p.since, until: p.until, maturity: p.maturity, spendIls: p.spendIls, fbLeads: p.fbLeads, leads: p.leads ?? 0, booked: p.booked ?? 0, buyers: p.buyers ?? 0, revenue: p.revenue ?? 0, campaignSpendIls: p.campaignSpendIls ?? null, campaignsWithSpend: p.campaignsWithSpend ?? null })) : null,
         ilsRate: data.ilsRate,
         adsets: data.adsets.map(s => ({ id: s.id, name: s.name, status: s.effective_status, learning: s.learning_stage_info?.status || null, dailyBudget: s.daily_budget ? round(num(s.daily_budget) / 100) : null, m7: s.m7, m30: s.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAdset?.[String(s.id)] || null])) : null })),
         ads: data.ads.map(a => ({ id: a.id, adsetId: a.adset_id, name: a.name, status: a.effective_status, thumb: a.creative?.thumbnail_url || a.creative?.image_url || null, m7: a.m7, m30: a.m30, crm: data.crm ? Object.fromEntries(data.crm.map((p: any) => [p.key, p.byAd?.[String(a.id)] || null])) : null })),
