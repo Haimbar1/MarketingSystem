@@ -123,6 +123,18 @@ export async function adsCredsForCurrentBusiness(): Promise<Creds | null> {
   return { token, accountId };
 }
 
+// ILS for one unit of the account's currency (the optics bills in USD) - the screen shows shekels.
+async function ilsPerUnit(currency: string): Promise<number | null> {
+  if (!currency || currency === 'ILS') return 1;
+  try {
+    const r = await fetch(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(currency)}&symbols=ILS`, { signal: AbortSignal.timeout(6000) });
+    const d: any = await r.json();
+    return Number(d?.rates?.ILS) || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function buildAdsSnapshot(creds: Creds, page: PageCreds) {
   const { token, accountId } = creds;
   const [account, campaigns, adsets, ads, customAudiences, savedAudiences, valueRuleSets, pixels, insights, permissions] = await Promise.all([
@@ -145,6 +157,7 @@ export async function buildAdsSnapshot(creds: Creds, page: PageCreds) {
   const granted = permissions.data.filter((p: any) => p?.status === 'granted').map((p: any) => String(p.permission));
   return {
     takenAt: new Date().toISOString(),
+    ilsRate: await ilsPerUnit(account.data?.currency || ''),
     accountId,
     account,
     token: { permissions: granted, canManageAds: granted.includes('ads_management') },

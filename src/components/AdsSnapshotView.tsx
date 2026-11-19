@@ -56,7 +56,23 @@ function StatusChip({ s }: { s?: string }) {
   return <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${cls}`}>{label}</span>;
 }
 
-const money = (minor: any, cur: string) => (minor == null || minor === '' ? '' : `${(Number(minor) / 100).toLocaleString('he-IL', { maximumFractionDigits: 2 })} ${cur}`);
+// Amounts in shekels (Haim, 2026-11-19 - "USD" in a Hebrew line read badly); the account's own
+// currency in Hebrew words next to it. RATE = today's ILS per unit, set when the snapshot loads.
+const CUR_HE: Record<string, string> = { USD: 'דולר', EUR: 'יורו', GBP: 'ליש"ט', ILS: 'ש"ח' };
+let RATE: number | null = null;
+const amount = (v: number, cur: string) => {
+  const own = `${v.toLocaleString('he-IL', { maximumFractionDigits: 2 })} ${CUR_HE[cur] || cur}`;
+  if (cur === 'ILS') return `₪${Math.round(v).toLocaleString('he-IL')}`;
+  return RATE ? `₪${Math.round(v * RATE).toLocaleString('he-IL')} (${own})` : own;
+};
+const money = (minor: any, cur: string) => (minor == null || minor === '' ? '' : amount(Number(minor) / 100, cur));
+const DEST_HE: Record<string, string> = {
+  ON_AD: 'טופס לידים בתוך פייסבוק / אינסטגרם', WEBSITE: 'אתר', WHATSAPP: 'וואטסאפ', MESSENGER: "מסנג'ר",
+  INSTAGRAM_DIRECT: 'הודעה באינסטגרם', PHONE_CALL: 'שיחת טלפון', ON_POST: 'הפוסט', ON_PAGE: 'הדף', UNDEFINED: '',
+};
+const PROMOTED_HE: Record<string, string> = { page_id: 'דף', pixel_id: 'פיקסל', custom_event_type: 'אירוע', lead_gen_form_id: 'טופס', application_id: 'אפליקציה', whatsapp_phone_number: 'מספר וואטסאפ' };
+const promotedText = (o: any) =>
+  Object.entries(o || {}).filter(([k]) => k in PROMOTED_HE).map(([k, v]) => `${PROMOTED_HE[k]}: ${v}`).join(' · ');
 const fmtDate = (s?: string) => (s ? new Date(s).toLocaleDateString('he-IL', { day: '2-digit', month: '2-digit', year: '2-digit' }) : '');
 
 function budgetOf(o: any, cur: string): string {
@@ -173,7 +189,7 @@ export default function AdsSnapshotView() {
     try {
       const d = await fetch('/api/meta-ads/snapshot').then(r => r.json());
       if (!d?.success) setError(d?.error || 'לא הצלחנו לקרוא את חשבון המודעות');
-      else setSnap(d.snapshot);
+      else { RATE = d.snapshot?.ilsRate || null; setSnap(d.snapshot); }
     } catch (e: any) {
       setError(e?.message || 'שגיאת רשת');
     } finally {
@@ -299,8 +315,8 @@ export default function AdsSnapshotView() {
                               </div>
                               {ins && (
                                 <p className="text-[11px] text-indigo-800 bg-indigo-50 rounded px-2 py-1">
-                                  30 ימים אחרונים: הוצאה {Number(ins.spend || 0).toLocaleString('he-IL')} {cur} · {Number(ins.impressions || 0).toLocaleString('he-IL')} חשיפות · {leads} לידים
-                                  {leads ? ` · ${(Number(ins.spend) / leads).toFixed(1)} ${cur} לליד` : ''}
+                                  30 ימים אחרונים: הוצאה {amount(Number(ins.spend || 0), cur)} · {Number(ins.impressions || 0).toLocaleString('he-IL')} חשיפות · {leads} לידים
+                                  {leads ? ` · ${amount(Number(ins.spend) / leads, cur)} לליד` : ''}
                                 </p>
                               )}
                               <Kv rows={[
@@ -308,8 +324,8 @@ export default function AdsSnapshotView() {
                                 ['תקציב', budgetOf(s, cur) || (budgetOf(c, cur) ? 'לפי הקמפיין (CBO)' : '')],
                                 ['אסטרטגיית הצעה', s.bid_strategy ? `${BID_HE[s.bid_strategy] || s.bid_strategy}${s.bid_amount ? ` · ${money(s.bid_amount, cur)}` : ''}` : ''],
                                 ['כללי ערך למיקום', s.value_rule_set_id ? `${ruleSetName.get(String(s.value_rule_set_id)) || s.value_rule_set_id}${s.value_rules_applied === false ? ' (לא מופעל)' : ''}` : ''],
-                                ['יעד', s.destination_type],
-                                ['אירוע / טופס', s.promoted_object ? Object.entries(s.promoted_object).map(([k, v]) => `${k}: ${v}`).join(' · ') : ''],
+                                ['יעד', s.destination_type ? (DEST_HE[s.destination_type] ?? s.destination_type) : ''],
+                                ['אירוע / טופס', promotedText(s.promoted_object)],
                                 ['שיוך', (s.attribution_spec || []).map((a: any) => `${a.event_type === 'CLICK_THROUGH' ? 'קליק' : a.event_type === 'VIEW_THROUGH' ? 'צפייה' : a.event_type} ${a.window_days} ימים`).join(' · ')],
                                 ['תדירות', (s.frequency_control_specs || []).map((f: any) => `${f.max_frequency} פעמים ב-${f.interval_days} ימים`).join(' · ')],
                                 ...describeTargeting(s.targeting),
@@ -415,7 +431,7 @@ export default function AdsSnapshotView() {
                 <Kv rows={[
                   ['חשבון', `${snap.account.data?.name || ''} (${snap.accountId})`],
                   ['עסק', snap.account.data?.business?.name || ''],
-                  ['מטבע / אזור זמן', `${cur} · ${snap.account.data?.timezone_name || ''}`],
+                  ['מטבע / אזור זמן', `${CUR_HE[cur] || cur}${cur !== 'ILS' && RATE ? ` (שער היום ${RATE.toFixed(2)} ₪)` : ''} · ${snap.account.data?.timezone_name || ''}`],
                   ['הוצאה מצטברת', snap.account.data?.amount_spent != null ? money(snap.account.data.amount_spent, cur) : ''],
                   ['תקרת הוצאה', snap.account.data?.spend_cap && snap.account.data.spend_cap !== '0' ? money(snap.account.data.spend_cap, cur) : 'אין'],
                 ]} />
