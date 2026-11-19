@@ -5,6 +5,7 @@ import React, { useEffect, useState } from 'react';
 import { ArrowRight, Loader2, RefreshCw, CheckCircle2, AlertTriangle, Undo2, Pause, Play, Pencil } from 'lucide-react';
 import WeeklyTrend, { Week } from './WeeklyTrend';
 import AudienceView, { Audience } from './AudienceView';
+import AdMediaPanel from './AdMediaPanel';
 
 type M = { spend: number; leads: number; cpl: number | null; ctr?: number | null; frequency?: number; impressions?: number } | null;
 type Suggestion = {
@@ -58,7 +59,9 @@ const withIls = (v: number, cur: string) => (cur !== 'ILS' && RATE ? `${fmt(v, c
 
 function describeChange(before: any, after: any, cur: string): string {
   if (!before || !after) return '';
-  if ('status' in after) return `${before.status === 'ACTIVE' ? 'פעיל' : 'מושהה'} ← ${after.status === 'ACTIVE' ? 'פעיל' : 'מושהה'}`;
+  if ('creative_id' in after) return 'הסרטון הוחלף (קריאייטיב חדש)';
+  if ('status' in after && before.status === 'ARCHIVED') return 'נוצרה מודעה חדשה (מושהית)';
+  if ('status' in after) return `${before.status === 'ACTIVE' ? 'פעיל' : 'מושהה'} ← ${after.status === 'ACTIVE' ? 'פעיל' : after.status === 'ARCHIVED' ? 'הוסרה' : 'מושהה'}`;
   if ('daily_budget' in after) return `${withIls(before.daily_budget / 100, cur)} ← ${withIls(after.daily_budget / 100, cur)} ליום`;
   if ('age_min' in after) return `גיל ${before.age_min}–${before.age_max} ← ${after.age_min}–${after.age_max}`;
   if ('value_rule_set_id' in after) return after.value_rule_set_id ? 'הפעלת ערכת כללי ערך' : 'הסרת כללי ערך';
@@ -226,6 +229,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
   const [editVals, setEditVals] = useState<{ min?: string; max?: string; ils?: string }>({});
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const [mediaFor, setMediaFor] = useState<string | null>(null); // the ad whose "🎬 סרטון" panel is open
 
   const cur = analysis?.currency || '';
   const rate = analysis?.ilsRate || null;
@@ -492,6 +496,15 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                             <button className={btn} disabled={busy} onClick={() => doManual(adPaused ? 'activate_ad' : 'pause_ad', a.id, {}, `${adPaused ? 'הפעלת' : 'השהיית'} מודעה`, `${adPaused ? 'להפעיל' : 'להשהות'} את המודעה "${a.name}"?`, () => patchAd(a.id, { configuredStatus: adPaused ? 'ACTIVE' : 'PAUSED', status: adPaused ? 'ACTIVE' : 'PAUSED' }))}>
                               {adPaused ? <><Play className="w-3 h-3" /> הפעל</> : <><Pause className="w-3 h-3" /> השהה</>}
                             </button>
+                          )}
+                          {canExecute && (
+                            <button className={btn} disabled={busy} onClick={() => setMediaFor(mediaFor === a.id ? null : a.id)}>🎬 סרטון</button>
+                          )}
+                          {mediaFor === a.id && (
+                            <div className="basis-full">
+                              <AdMediaPanel ad={{ id: a.id, name: a.name }} onClose={() => setMediaFor(null)}
+                                onDone={text => { setMediaFor(null); setNotice({ ok: true, text }); loadChanges(); }} />
+                            </div>
                           )}
                         </div>
                       );

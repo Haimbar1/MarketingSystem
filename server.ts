@@ -9,6 +9,7 @@ import { SESSION_HEADER, sessionFromPortalToken, verifySession } from './server/
 import { runWithTenant } from './server/tenant.js';
 import { registerAdsSnapshotRoutes } from './server/metaAdsSnapshot.js';
 import { registerOptimizerRoutes } from './server/campaignOptimizer.js';
+import { registerAdMediaRoutes } from './server/adMedia.js';
 
 const requestHost = (req: express.Request) =>
   String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
@@ -48,6 +49,8 @@ export async function createApp({ serveFrontend }: { serveFrontend: boolean }) {
   registerAdsSnapshotRoutes(app);
   // Maintaining a running campaign: analyse → suggestions → approve → execute / undo.
   registerOptimizerRoutes(app);
+  // Replace / add a video in an ad (new ad in the same ad set, or swap the creative).
+  registerAdMediaRoutes(app);
 
   app.use('/api', (_req, res) => res.status(404).json({ success: false, error: 'not-found' }));
 

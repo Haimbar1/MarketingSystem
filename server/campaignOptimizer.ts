@@ -25,7 +25,7 @@ import { currentTenant } from './tenant.js';
 const GRAPH = 'https://graph.facebook.com/v21.0';
 type Creds = { token: string; accountId: string };
 
-async function gget(path: string, token: string, params: Record<string, string> = {}): Promise<{ ok: boolean; data: any }> {
+export async function gget(path: string, token: string, params: Record<string, string> = {}): Promise<{ ok: boolean; data: any }> {
   const url = path.startsWith('http') ? path : `${GRAPH}/${path}?${new URLSearchParams({ ...params, access_token: token })}`;
   try {
     const r = await fetch(url, { signal: AbortSignal.timeout(25000) });
@@ -35,7 +35,7 @@ async function gget(path: string, token: string, params: Record<string, string> 
   }
 }
 
-async function gpost(path: string, token: string, body: Record<string, string>): Promise<{ ok: boolean; data: any }> {
+export async function gpost(path: string, token: string, body: Record<string, string>): Promise<{ ok: boolean; data: any }> {
   try {
     const r = await fetch(`${GRAPH}/${path}`, {
       method: 'POST',
@@ -49,7 +49,7 @@ async function gpost(path: string, token: string, body: Record<string, string>):
   }
 }
 
-const metaErr = (d: any) => {
+export const metaErr = (d: any) => {
   const e = d?.error;
   if (!e) return 'שגיאה לא ידועה מ-Meta';
   return [e.error_user_title, e.error_user_msg || e.message, e.code ? `(#${e.code}${e.error_subcode ? `/${e.error_subcode}` : ''})` : ''].filter(Boolean).join(' · ');
@@ -473,24 +473,26 @@ function parseJson(text: string): any {
 
 // ---------- applying one change ----------
 
-async function readTarget(token: string, type: string, id: string) {
-  const fields = type === 'ad' ? 'id,status' : type === 'campaign' ? 'id,status,daily_budget' : 'id,status,daily_budget,targeting,value_rule_set_id,bid_adjustments';
+export async function readTarget(token: string, type: string, id: string) {
+  const fields = type === 'ad' ? 'id,status,creative{id}' : type === 'campaign' ? 'id,status,daily_budget' : 'id,status,daily_budget,targeting,value_rule_set_id,bid_adjustments';
   return gget(id, token, { fields });
 }
 
 // Is the object still as it was ("before")? Compares only the fields the change touches.
-function stillAsBefore(obj: any, before: Record<string, any>): boolean {
+export function stillAsBefore(obj: any, before: Record<string, any>): boolean {
   return Object.entries(before).every(([k, v]) => {
     if (k === 'age_min' || k === 'age_max') return num(obj?.targeting?.[k] || (k === 'age_min' ? 18 : 65)) === num(v);
     if (k === 'daily_budget') return num(obj?.[k]) === num(v);
+    if (k === 'creative_id') return String(obj?.creative?.id ?? '') === String(v ?? '');
     return String(obj?.[k] ?? '') === String(v ?? '');
   });
 }
 
-async function writeTarget(token: string, type: string, id: string, current: any, values: Record<string, any>) {
+export async function writeTarget(token: string, type: string, id: string, current: any, values: Record<string, any>) {
   const body: Record<string, string> = {};
   if ('status' in values) body.status = String(values.status);
   if ('daily_budget' in values) body.daily_budget = String(values.daily_budget);
+  if ('creative_id' in values) body.creative = JSON.stringify({ creative_id: String(values.creative_id) });
   if ('age_min' in values || 'age_max' in values) {
     const t = { ...(current?.targeting || {}) };
     if ('age_min' in values) t.age_min = values.age_min;
@@ -704,7 +706,8 @@ export function registerOptimizerRoutes(app: express.Express) {
       if (ch.status !== 'done' || ch.undone_at || ch.undo_of) return res.json({ success: false, error: 'אי אפשר לבטל את השינוי הזה' });
       const now = await readTarget(creds.token, ch.object_type, ch.object_id);
       if (!now.ok) return res.json({ success: false, error: metaErr(now.data) });
-      if (!stillAsBefore(now.data, ch.after)) return res.json({ success: false, error: 'הערך השתנה שוב במטא מאז - לא בוטל' });
+      // a new ad is undone by archiving it whatever its status became (someone may have turned it on)
+      if (ch.action !== 'create_ad' && !stillAsBefore(now.data, ch.after)) return res.json({ success: false, error: 'הערך השתנה שוב במטא מאז - לא בוטל' });
       const w = await writeTarget(creds.token, ch.object_type, ch.object_id, now.data, ch.before);
       const ok = w.ok && w.data?.success !== false;
       await p.query(
