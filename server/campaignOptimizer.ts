@@ -250,6 +250,7 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta (פייסב�
 - רכישות מגיעות ימים-שבועות אחרי הליד: ב-7 הימים האחרונים הן חלקיות - לשפוט רכישות לפי 30 יום, ותורים גם לפי 7.
 - אם crm חסר בסט/מודעה - ייתכן שהלידים לא שויכו (leadsWithUnknownAdset30); לא להסיק מזה שאין תוצאות.
 - לציין בממצאים את העלות לתור ואת ה-ROAS כשאפשר.
+- בטקסטים (summary / findings / why / expected) לכתוב סכומים בשקלים בלבד (₪, אחרי המרה לפי ilsPerCurrencyUnit), לא בדולרים ולא "USD". רק ב-params.dailyBudget - המספר במטבע החשבון.
 
 כללים מקצועיים:
 - לא להסיק מסקנות ממעט נתונים: מודעה/סט עם פחות מ-3 לידים או הוצאה נמוכה מפי 2 מהעלות לליד הממוצעת - "אין מספיק נתונים", לא לעצור.
@@ -350,7 +351,8 @@ function validate(raw: any, d: CampaignData, idx: number): Suggestion {
       if (!next) return asAdvice('לא צוין תקציב חדש');
       // hard limits: at most +50% / -50% in one change, never under the account's minimum
       const capped = Math.min(Math.max(next, Math.round(cur * 0.5)), Math.round(cur * 1.5));
-      const note = capped !== next ? `הוגבל ל-${round(capped / 100)} ${d.currency} (שינוי של עד 50% בבת אחת)` : undefined;
+      const curHe = ({ USD: 'דולר', EUR: 'יורו', ILS: 'ש"ח' } as Record<string, string>)[d.currency] || d.currency;
+      const note = capped !== next ? `הוגבל ל-${round(capped / 100)} ${curHe}${d.ilsRate && d.currency !== 'ILS' ? ` (≈₪${Math.round((capped / 100) * d.ilsRate)})` : ''} ליום (שינוי של עד 50% בבת אחת)` : undefined;
       next = Math.max(capped, d.minDailyBudget || 0);
       if (next === cur) return asAdvice('התקציב החדש זהה לקיים');
       return {

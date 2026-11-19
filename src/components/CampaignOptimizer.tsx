@@ -38,12 +38,18 @@ const ACTION_HE: Record<string, string> = {
   apply_value_rule_set: 'כללי ערך למיקום', manual: 'המלצה (ביצוע ידני)',
 };
 
-const fmt = (v: number | null | undefined, cur = '') => (v == null ? '—' : `${Number(v).toLocaleString('he-IL', { maximumFractionDigits: 2 })}${cur ? ` ${cur}` : ''}`);
+// The account's currency in Hebrew words (Haim, 2026-11-19 - "USD" in a Hebrew line read backwards).
+const CUR_HE: Record<string, string> = { USD: 'דולר', EUR: 'יורו', GBP: 'ליש"ט', ILS: 'ש"ח' };
+const curName = (cur: string) => CUR_HE[cur] || cur;
+const fmt = (v: number | null | undefined, cur = '') => (v == null ? '—' : `${Number(v).toLocaleString('he-IL', { maximumFractionDigits: 2 })}${cur ? ` ${curName(cur)}` : ''}`);
+
+let RATE: number | null = null; // today's ILS rate of the account currency, set when an analysis loads
+const withIls = (v: number, cur: string) => (cur !== 'ILS' && RATE ? `${fmt(v, cur)} (≈₪${Math.round(v * RATE).toLocaleString('he-IL')})` : fmt(v, cur));
 
 function describeChange(before: any, after: any, cur: string): string {
   if (!before || !after) return '';
   if ('status' in after) return `${before.status === 'ACTIVE' ? 'פעיל' : 'מושהה'} ← ${after.status === 'ACTIVE' ? 'פעיל' : 'מושהה'}`;
-  if ('daily_budget' in after) return `${fmt(before.daily_budget / 100, cur)} ← ${fmt(after.daily_budget / 100, cur)} ליום`;
+  if ('daily_budget' in after) return `${withIls(before.daily_budget / 100, cur)} ← ${withIls(after.daily_budget / 100, cur)} ליום`;
   if ('age_min' in after) return `גיל ${before.age_min}–${before.age_max} ← ${after.age_min}–${after.age_max}`;
   if ('value_rule_set_id' in after) return after.value_rule_set_id ? 'הפעלת ערכת כללי ערך' : 'הסרת כללי ערך';
   return '';
@@ -63,9 +69,74 @@ function CrmLine({ crm, spend, rate }: { crm?: CrmWin; spend?: number; rate?: nu
   );
 }
 
-function MetricsCell({ m, cur }: { m: M; cur: string }) {
+// Money in shekels (the account may bill in USD - converted at today's rate), with the original amount
+// on hover.
+function ils(v: number | null | undefined, rate: number | null | undefined, cur: string): string {
+  if (v == null) return '—';
+  if (cur === 'ILS' || !rate) return cur === 'ILS' ? `₪${Math.round(v).toLocaleString('he-IL')}` : fmt(v, cur);
+  return `₪${Math.round(v * rate).toLocaleString('he-IL')}`;
+}
+
+// "7 / 30 ימים" as a table, every number labelled (Haim, 2026-11-19 - "279.86 USD · 49 לידים" wasn't clear).
+function SummaryTable({ a }: { a: Analysis }) {
+  const cur = a.currency, rate = a.ilsRate;
+  const rows = [
+    { label: '7 ימים אחרונים', m: a.totals.last7, crm: a.crm?.last7 },
+    { label: '30 ימים אחרונים', m: a.totals.last30, crm: a.crm?.last30 },
+  ];
+  const per = (spend: number, n: number) => (n > 0 ? ils(spend / n, rate, cur) : '—');
+  const roas = (rev: number, spend: number) => (rate && spend > 0 ? `${(rev / (spend * rate)).toFixed(1)}x` : '—');
+  const th = 'px-2 py-1.5 font-bold text-gray-600 text-right whitespace-nowrap';
+  const td = 'px-2 py-1.5 text-gray-800 whitespace-nowrap';
+  return (
+    <div className="overflow-x-auto">
+      <table className="text-xs w-full border border-gray-200 rounded-lg">
+        <thead className="bg-gray-50">
+          <tr>
+            <th className={th}></th>
+            <th className={th} title="כמה הוצא על הקמפיין במטא">הוצאה</th>
+            <th className={th} title="לידים שמטא ספרה (טפסים שמולאו)">לידים במטא</th>
+            <th className={th}>עלות לליד</th>
+            {a.crm && <>
+              <th className={`${th} bg-emerald-50`} title="לידים של הקמפיין שנכנסו ל-CRM בתקופה">לידים ב-CRM</th>
+              <th className={`${th} bg-emerald-50`}>קבעו תור</th>
+              <th className={`${th} bg-emerald-50`}>עלות לתור</th>
+              <th className={`${th} bg-emerald-50`}>קנו</th>
+              <th className={`${th} bg-emerald-50`}>הכנסה</th>
+              <th className={`${th} bg-emerald-50`} title="הכנסה חלקי הוצאה">החזר (ROAS)</th>
+            </>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.label} className="border-t border-gray-100">
+              <td className={`${td} font-bold`}>{r.label}</td>
+              <td className={td} title={cur !== 'ILS' ? fmt(r.m.spend, cur) : undefined}>{ils(r.m.spend, rate, cur)}</td>
+              <td className={td}>{r.m.leads}</td>
+              <td className={td}>{per(r.m.spend, r.m.leads)}</td>
+              {a.crm && r.crm && <>
+                <td className={td}>{r.crm.leads}</td>
+                <td className={td}>{r.crm.booked}</td>
+                <td className={td}>{per(r.m.spend, r.crm.booked)}</td>
+                <td className={td}>{r.crm.buyers}</td>
+                <td className={td}>₪{Math.round(r.crm.revenue).toLocaleString('he-IL')}</td>
+                <td className={td}>{roas(r.crm.revenue, r.m.spend)}</td>
+              </>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="text-[10px] text-gray-400 mt-1">
+        {cur !== 'ILS' && rate ? `ההוצאה במטא היא ב${curName(cur)}, הומרה לשקלים לפי שער היום (${rate.toFixed(2)}). ` : ''}
+        {a.crm ? 'לידים / תורים / רכישות לפי יום כניסת הליד ל-CRM; רכישות מגיעות לרוב ימים-שבועות אחרי הליד, ולכן ב-7 הימים האחרונים הן חלקיות.' : ''}
+      </p>
+    </div>
+  );
+}
+
+function MetricsCell({ m, cur, rate }: { m: M; cur: string; rate?: number | null }) {
   if (!m) return <span className="text-gray-400">—</span>;
-  return <span>{fmt(m.spend, cur)} · {m.leads} לידים · {m.cpl == null ? '—' : fmt(m.cpl, cur)} לליד</span>;
+  return <span>הוצאה {ils(m.spend, rate, cur)} · {m.leads} לידים · {m.cpl == null ? '—' : ils(m.cpl, rate, cur)} לליד</span>;
 }
 
 export default function CampaignOptimizer({ campaign, onClose }: { campaign: { id: string; name: string }; onClose: () => void }) {
@@ -97,6 +168,7 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
     try {
       const d = await fetch(`/api/meta-ads/campaigns/${campaign.id}/analyze`, { method: 'POST' }).then(r => r.json());
       if (!d?.success) { setError(d?.error || 'הניתוח נכשל'); return; }
+      RATE = d.analysis?.ilsRate || null;
       setOptId(d.optimizationId); setAnalysis(d.analysis); setSuggestions(d.suggestions || []); setCanExecute(!!d.canExecute);
       const b: Record<string, string> = {};
       (d.suggestions || []).forEach((s: Suggestion) => { if (s.params?.dailyBudget != null) b[s.id] = String(s.params.dailyBudget); });
@@ -167,15 +239,11 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
               <div className="space-y-2">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className={`text-xs font-bold px-2 py-0.5 rounded ${HEALTH[analysis.health]?.[1]}`}>{HEALTH[analysis.health]?.[0]}</span>
-                  <span className="text-xs text-gray-500">
-                    7 ימים: {fmt(analysis.totals.last7.spend, cur)} · {analysis.totals.last7.leads} לידים · {fmt(analysis.totals.last7.cpl, cur)} לליד
-                    {'  |  '}30 יום: {fmt(analysis.totals.last30.spend, cur)} · {analysis.totals.last30.leads} לידים · {fmt(analysis.totals.last30.cpl, cur)} לליד
-                  </span>
+
                 </div>
                 <p className="text-sm text-gray-800">{analysis.summary}</p>
-                {analysis.crm ? (
-                  <p className="text-xs bg-emerald-50 rounded-lg px-2 py-1"><CrmLine crm={analysis.crm} spend={analysis.totals.last30.spend} rate={analysis.ilsRate} /></p>
-                ) : (
+                <SummaryTable a={analysis} />
+                {!analysis.crm && (
                   <p className="text-[11px] text-gray-500">אין נתוני CRM לקמפיין הזה (אין CRM לעסק, או שהלידים לא שויכו לקמפיין) - הניתוח לפי נתוני מטא בלבד.</p>
                 )}
                 {analysis.findings.length > 0 && (
@@ -189,14 +257,14 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                 <div className="mt-2 space-y-2">
                   {analysis.adsets.map(s => (
                     <div key={s.id} className="bg-gray-50 rounded-lg p-2">
-                      <div className="font-bold text-gray-800">{s.name} <span className="font-normal text-gray-500">· {s.status}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${fmt(s.dailyBudget, cur)} ליום` : ''}</span></div>
-                      <div className="text-gray-600">7 ימים: <MetricsCell m={s.m7} cur={cur} /> · 30 יום: <MetricsCell m={s.m30} cur={cur} /></div>
+                      <div className="font-bold text-gray-800">{s.name} <span className="font-normal text-gray-500">· {s.status}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}</span></div>
+                      <div className="text-gray-600">7 ימים אחרונים: <MetricsCell m={s.m7} cur={cur} rate={analysis.ilsRate} /> · 30 ימים אחרונים: <MetricsCell m={s.m30} cur={cur} rate={analysis.ilsRate} /></div>
                       {s.crm && <div><CrmLine crm={s.crm} spend={s.m30?.spend} rate={analysis.ilsRate} /></div>}
                       {analysis.ads.filter(a => a.adsetId === s.id).map(a => (
                         <div key={a.id} className="flex items-center gap-2 mt-1 pr-3">
                           {a.thumb && <img src={a.thumb} alt="" className="w-7 h-7 rounded object-cover" loading="lazy" />}
                           <span className="text-gray-700 truncate">{a.name}</span>
-                          <span className="text-gray-500 shrink-0">· 7 ימים: <MetricsCell m={a.m7} cur={cur} /></span>
+                          <span className="text-gray-500 shrink-0">· 7 ימים אחרונים: <MetricsCell m={a.m7} cur={cur} rate={analysis.ilsRate} /></span>
                           {a.crm && <span className="shrink-0">· <CrmLine crm={a.crm} spend={a.m30?.spend} rate={analysis.ilsRate} /></span>}
                         </div>
                       ))}
@@ -231,7 +299,7 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                               <span>תקציב יומי חדש:</span>
                               <input type="number" min={0} step="0.5" value={budgets[s.id] ?? ''} onChange={e => setBudgets(b => ({ ...b, [s.id]: e.target.value }))}
                                 className="w-24 border border-gray-300 rounded px-2 py-1" />
-                              <span>{cur}</span>
+                              <span>{curName(cur)}{cur !== 'ILS' && analysis.ilsRate && budgets[s.id] ? ` (≈₪${Math.round(Number(budgets[s.id]) * analysis.ilsRate).toLocaleString('he-IL')})` : ''}</span>
                             </div>
                           )}
                           {res && (
@@ -259,7 +327,7 @@ export default function CampaignOptimizer({ campaign, onClose }: { campaign: { i
                   <p className="font-bold text-sm text-gray-800">לבצע עכשיו בקמפיין החי?</p>
                   <ul className="text-xs text-gray-700 list-disc pr-5 space-y-0.5">
                     {chosen.map(s => (
-                      <li key={s.id}>{s.title} - {s.targetName}{s.params?.dailyBudget != null ? ` (${fmt(Number(budgets[s.id]), cur)} ליום)` : ` (${describeChange(s.before, s.after, cur)})`}</li>
+                      <li key={s.id}>{s.title} - {s.targetName}{s.params?.dailyBudget != null ? ` (${withIls(Number(budgets[s.id]), cur)} ליום)` : ` (${describeChange(s.before, s.after, cur)})`}</li>
                     ))}
                   </ul>
                   <div className="flex gap-2">
