@@ -15,7 +15,7 @@ export type Week = {
 
 const C = { lead: '#2a78d6', booked: '#eb6834', buyer: '#1baf7a', grid: '#e7e5e4', axis: '#78716c', text: '#1c1917', muted: '#78716c' };
 const W = 640, PAD_L = 44, PAD_R = 64, PAD_T = 14;
-const dd = (d: string) => `${d.slice(8, 10)}/${d.slice(5, 7)}`;
+const dd = (d: string) => `${d.slice(8, 10)}.${d.slice(5, 7)}`;
 const ils = (v: number | null) => (v == null || !isFinite(v) ? '—' : `₪${Math.round(v).toLocaleString('he-IL')}`);
 const per = (spend: number | null, n: number) => (spend != null && n > 0 ? spend / n : null);
 
@@ -51,9 +51,9 @@ export default function WeeklyTrend({ weeks }: { weeks: Week[] }) {
         onMouseEnter={() => setHover(i)} onClick={() => setHover(i)} style={{ cursor: 'pointer' }} />
     ));
   const xLabels = (h: number) =>
-    weeks.map((wk, i) => (i % 2 === (n - 1) % 2 || n <= 6 ? (
-      <text key={i} x={xc(i)} y={PAD_T + h + 14} textAnchor="middle" fontSize={10} fill={i === sel ? C.text : C.muted}>{dd(wk.since)}</text>
-    ) : null));
+    weeks.map((wk, i) => (
+      <text key={i} x={xc(i)} y={PAD_T + h + 14} textAnchor="middle" fontSize={9} fontWeight={i === sel ? 700 : 400} fill={i === sel ? C.text : C.muted}>{dd(wk.since)}–{dd(wk.until)}</text>
+    ));
 
   // 1. leads
   const H1 = 110;
@@ -146,7 +146,8 @@ export default function WeeklyTrend({ weeks }: { weeks: Week[] }) {
         <div dir="ltr" onMouseLeave={() => setHover(null)}>
           {/* 1. leads per week */}
           <div className="text-[11px] font-bold text-gray-700 text-right" dir="rtl">כמות לידים</div>
-          <svg viewBox={`0 0 ${W} ${PAD_T + H1 + 20}`} className="w-full" role="img" aria-label="כמות לידים לשבוע">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <svg viewBox={`0 0 ${W} ${PAD_T + H1 + 20}`} className="w-full sm:flex-1 min-w-0" role="img" aria-label="כמות לידים לשבוע">
             {yAxis(leadMax, H1, v => String(Math.round(v)))}
             {weeks.map((x, i) => {
               const h = (x.leads / leadMax) * H1;
@@ -156,13 +157,16 @@ export default function WeeklyTrend({ weeks }: { weeks: Week[] }) {
             {xLabels(H1)}
             {hoverBands(H1)}
           </svg>
+          {/* the same column as the charts below, so the weeks line up */}
+          <div className="flex sm:flex-col justify-start gap-2 text-xs text-gray-800 sm:w-32 shrink-0" dir="rtl">
+            <span className="flex items-center gap-1.5 whitespace-nowrap"><span className="inline-block w-3.5 h-3.5 rounded-sm" style={{ background: C.lead }} />לידים <b className="text-gray-900">{w?.leads ?? ''}</b></span>
+          </div>
+          </div>
 
           {/* 2. cost per lead / booked / buyer */}
-          <div className="flex flex-wrap items-center justify-end gap-3 text-[11px] text-gray-700" dir="rtl">
-            <b>עלות לליד / לתור / לרוכש</b>
-            {SERIES.map(s => <span key={s.key} className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 rounded" style={{ background: s.color, height: 2 }} />{s.label}</span>)}
-          </div>
-          <svg viewBox={`0 0 ${W} ${PAD_T + H2 + 20}`} className="w-full" role="img" aria-label="עלות לליד, לתור ולרוכש לשבוע">
+          <div className="text-[11px] font-bold text-gray-700 text-right mt-2" dir="rtl">עלות לליד / לתור / לרוכש</div>
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <svg viewBox={`0 0 ${W} ${PAD_T + H2 + 20}`} className="w-full sm:flex-1 min-w-0" role="img" aria-label="עלות לליד, לתור ולרוכש לשבוע">
             {yAxis(costMax, H2, v => `₪${Math.round(v)}`)}
             {SERIES.map(s => <path key={s.key} d={path(s.key)} fill="none" stroke={s.color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />)}
             {SERIES.map(s => costs.map((c, i) => (c[s.key] != null ? (
@@ -172,14 +176,21 @@ export default function WeeklyTrend({ weeks }: { weeks: Week[] }) {
             {xLabels(H2)}
             {hoverBands(H2)}
           </svg>
+          {/* the legend beside the chart, on the right (Haim: "the legend somewhere clearer") */}
+          <div className="flex sm:flex-col flex-wrap justify-start gap-x-4 gap-y-2 text-xs text-gray-800 sm:w-32 shrink-0" dir="rtl">
+            {SERIES.map(s => (
+              <span key={s.key} className="flex items-center gap-1.5 whitespace-nowrap">
+                <svg width="22" height="10" aria-hidden="true"><line x1="1" y1="5" x2="21" y2="5" stroke={s.color} strokeWidth="3" strokeLinecap="round" /><circle cx="11" cy="5" r="3.5" fill={s.color} stroke="#fff" strokeWidth="1.5" /></svg>
+                {s.label}{costs[sel]?.[s.key] != null ? <b className="text-gray-900">{ils(costs[sel][s.key])}</b> : null}
+              </span>
+            ))}
+          </div>
+          </div>
 
           {/* 3. ROAS */}
-          <div className="flex flex-wrap items-center justify-end gap-3 text-[11px] text-gray-700" dir="rtl">
-            <b>החזר על ההוצאה (הכנסה ÷ הוצאה)</b>
-            <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: C.buyer }} />הבשיל</span>
-            <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: C.buyer, opacity: 0.35 }} />רכישות עוד מגיעות</span>
-          </div>
-          <svg viewBox={`0 0 ${W} ${PAD_T + H3 + 20}`} className="w-full" role="img" aria-label="החזר על ההוצאה לשבוע">
+          <div className="text-[11px] font-bold text-gray-700 text-right mt-2" dir="rtl">החזר על ההוצאה (הכנסה ÷ הוצאה)</div>
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <svg viewBox={`0 0 ${W} ${PAD_T + H3 + 20}`} className="w-full sm:flex-1 min-w-0" role="img" aria-label="החזר על ההוצאה לשבוע">
             {yAxis(roasMax, H3, v => `${v.toFixed(v < 10 ? 1 : 0)}x`)}
             <line x1={PAD_L} x2={W - PAD_R} y1={yRoas(1)} y2={yRoas(1)} stroke={C.axis} strokeWidth={1} strokeDasharray="4 3" />
             <text x={PAD_L + 4} y={yRoas(1) - 4} fontSize={10} fill={C.muted}>1x</text>
@@ -194,7 +205,13 @@ export default function WeeklyTrend({ weeks }: { weeks: Week[] }) {
             {xLabels(H3)}
             {hoverBands(H3)}
           </svg>
-          <p className="text-[10px] text-gray-400 text-right" dir="rtl">התאריך מתחת לכל עמודה = תחילת השבוע. הקו המקווקו = 1x (ההכנסה שווה להוצאה). לידים מהשבועות האחרונים עוד קונים, לכן ההחזר שלהם עוד יעלה.</p>
+          <div className="flex sm:flex-col flex-wrap justify-start gap-x-4 gap-y-2 text-xs text-gray-800 sm:w-32 shrink-0" dir="rtl">
+            <span className="flex items-center gap-1.5 whitespace-nowrap"><span className="inline-block w-3.5 h-3.5 rounded-sm" style={{ background: C.buyer }} />הבשיל</span>
+            <span className="flex items-center gap-1.5 whitespace-nowrap"><span className="inline-block w-3.5 h-3.5 rounded-sm" style={{ background: C.buyer, opacity: 0.35 }} />רכישות עוד מגיעות</span>
+            <span className="flex items-center gap-1.5 whitespace-nowrap"><svg width="22" height="10" aria-hidden="true"><line x1="1" y1="5" x2="21" y2="5" stroke={C.axis} strokeWidth="1.5" strokeDasharray="4 3" /></svg>1x = ההכנסה שווה להוצאה</span>
+          </div>
+          </div>
+          <p className="text-[10px] text-gray-400 text-right" dir="rtl">מתחת לכל עמודה - התאריכים של השבוע. לידים מהשבועות האחרונים עוד קונים, לכן ההחזר שלהם עוד יעלה.</p>
         </div>
       )}
     </div>
