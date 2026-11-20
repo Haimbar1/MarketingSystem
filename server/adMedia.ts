@@ -11,7 +11,7 @@
 // Meta decides each piece's size (start_offset → end_offset) and it can be bigger than Vercel's 4.5MB
 // body limit, so the browser sends 3MB pieces and the server keeps them in mk_video_uploads until
 // Meta's piece is complete, then transfers it.
-import { fixAssetRules } from './assetRules.js';
+import { fixAssetRules, cleanDof } from './assetRules.js';
 import express from 'express';
 import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
 import { db, ensureTables } from './db.js';
@@ -73,7 +73,7 @@ export function creativeWithMedia(c: any, media: Media | null, target: Target = 
   if (!c) return { error: 'לא הצלחנו לקרוא את המודעה' };
   const out: CreativeSpec = {};
   if (c.url_tags) out.url_tags = c.url_tags;
-  if (c.degrees_of_freedom_spec) out.degrees_of_freedom_spec = c.degrees_of_freedom_spec;
+  if (c.degrees_of_freedom_spec) out.degrees_of_freedom_spec = cleanDof(c.degrees_of_freedom_spec);
   const oss = clone(c.object_story_spec);
 
   // a flexible ad (several pictures / videos / texts)

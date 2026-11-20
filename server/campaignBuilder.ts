@@ -20,7 +20,7 @@ import { db, ensureTables } from './db.js';
 import { currentTenant, currentUser } from './tenant.js';
 import { gget, metaErr, ilsPerUnit, targetingSummary, parseJson } from './campaignOptimizer.js';
 import { creativeWithMedia, Media } from './adMedia.js';
-import { fixAssetRules } from './assetRules.js';
+import { fixAssetRules, cleanDof } from './assetRules.js';
 import { tenantSecret } from './secrets.js';
 
 // ---------- the campaign's kind: where the ad leads (Haim, 2026-11-20 - "where is it set that it's a
@@ -550,6 +550,7 @@ async function buildAds(draft: Draft, base: Base, media: Media[], token: string,
       spec = { object_story_spec: c.object_story_spec, asset_feed_spec: c.asset_feed_spec, degrees_of_freedom_spec: c.degrees_of_freedom_spec, url_tags: c.url_tags };
     }
     spec = applyTexts(JSON.parse(JSON.stringify(spec)), draft.texts);
+    if (spec.degrees_of_freedom_spec !== undefined) spec.degrees_of_freedom_spec = cleanDof(spec.degrees_of_freedom_spec);
     if (whatsapp) spec = toWhatsAppSpec(spec);
     if (!spec.object_story_spec && !spec.asset_feed_spec) { errors.push(`${ad.name}: המודעה מבוססת על פוסט קיים - דילגנו`); continue; }
     const crBody: Record<string, any> = { name: `${draft.name} - ${ad.name}`.slice(0, 200) };

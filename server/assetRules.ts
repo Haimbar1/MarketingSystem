@@ -33,3 +33,19 @@ export function fixAssetRules(afs: any): any {
   }
   return afs;
 }
+
+// Meta retired "standard enhancements" (`degrees_of_freedom_spec.creative_features_spec.standard_enhancements`):
+// a creative copied from an older ad that still has it is refused — "Creative should not include standard
+// enhancements … Please choose to set individual features instead" (#100/3858504, Haim's fourth try,
+// 2026-11-20). The copy keeps every individual feature the ad had and drops only that one; with nothing
+// left, the whole spec goes (Meta's defaults).
+export function cleanDof(dof: any): any {
+  if (!dof || typeof dof !== 'object') return undefined;
+  const out = JSON.parse(JSON.stringify(dof));
+  const cfs = out.creative_features_spec;
+  if (cfs && typeof cfs === 'object') {
+    delete cfs.standard_enhancements;
+    if (!Object.keys(cfs).length) delete out.creative_features_spec;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
