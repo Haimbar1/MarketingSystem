@@ -5,6 +5,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Loader2, RefreshCw, Download, ChevronDown, ChevronLeft } from 'lucide-react';
 import CampaignOptimizer from './CampaignOptimizer';
+import NewCampaignBuilder from './NewCampaignBuilder';
 
 type Part = { ok: boolean; data: any[]; error?: string; droppedFields?: string[] };
 type Snapshot = {
@@ -183,6 +184,7 @@ export default function AdsSnapshotView() {
   const [showAll, setShowAll] = useState(false);
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [optimizeFor, setOptimizeFor] = useState<{ id: string; name: string } | null>(null);
+  const [building, setBuilding] = useState(false);
 
   const load = async () => {
     setLoading(true); setError('');
@@ -230,6 +232,7 @@ export default function AdsSnapshotView() {
 
   // the campaign's analysis opens in the page, in place of the list (Haim, 2026-11-19 - not a pop-up)
   if (optimizeFor) return <CampaignOptimizer campaign={optimizeFor} onBack={() => setOptimizeFor(null)} />;
+  if (building) return <NewCampaignBuilder onBack={() => { setBuilding(false); load(); }} />;
 
   return (
     <div dir="rtl">
@@ -243,6 +246,7 @@ export default function AdsSnapshotView() {
             </p>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            <button onClick={() => setBuilding(true)} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg px-3 py-2 whitespace-nowrap">✨ קמפיין חדש מהוראה</button>
             <button onClick={load} disabled={loading} title="קרא שוב" className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 disabled:opacity-50">
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             </button>

@@ -106,7 +106,7 @@ const INSIGHT_FIELDS = 'campaign_id,adset_id,ad_id,spend,impressions,reach,frequ
 const ADSET_FIELDS = 'id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object,destination_type,learning_stage_info,value_rule_set_id,value_rules_applied,bid_adjustments,start_time';
 const AD_FIELDS = 'id,name,adset_id,status,effective_status,created_time,creative{id,object_type,body,title,image_url,thumbnail_url,video_id,asset_feed_spec,object_story_spec}';
 
-function targetingSummary(t: any) {
+export function targetingSummary(t: any) {
   if (!t) return null;
   const geo = t.geo_locations || {};
   return {
@@ -181,7 +181,7 @@ export function outcomeWeeks(today = israelToday()) {
 
 // ILS for one unit of the ad account's currency (the optics bills in USD), to compare spend with CRM
 // revenue. null when it can't be read.
-async function ilsPerUnit(currency: string): Promise<number | null> {
+export async function ilsPerUnit(currency: string): Promise<number | null> {
   if (!currency || currency === 'ILS') return 1;
   try {
     const r = await fetch(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(currency)}&symbols=ILS`, { signal: AbortSignal.timeout(6000) });
@@ -364,7 +364,7 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta (פייסב�
 
 // ---------- checking each suggestion ----------
 
-export const EXEC_ACTIONS = ['pause_ad', 'activate_ad', 'pause_adset', 'activate_adset', 'set_adset_daily_budget', 'set_campaign_daily_budget', 'set_adset_age', 'apply_value_rule_set'] as const;
+export const EXEC_ACTIONS = ['pause_ad', 'activate_ad', 'pause_adset', 'activate_adset', 'pause_campaign', 'activate_campaign', 'set_adset_daily_budget', 'set_campaign_daily_budget', 'set_adset_age', 'apply_value_rule_set'] as const;
 type ExecAction = typeof EXEC_ACTIONS[number];
 
 export interface Suggestion {
@@ -415,6 +415,13 @@ function validate(raw: any, d: CampaignData, idx: number): Suggestion {
       }
       return { ...s, targetType: 'ad', targetName: ad.name, before: { status: ad.status }, after: { status: to } };
     }
+    case 'pause_campaign':
+    case 'activate_campaign': {
+      if (String(d.campaign?.id) !== targetId) return asAdvice('הקמפיין לא נמצא');
+      const to = action === 'pause_campaign' ? 'PAUSED' : 'ACTIVE';
+      if (d.campaign.status === to) return asAdvice(to === 'PAUSED' ? 'הקמפיין כבר מושהה' : 'הקמפיין כבר פעיל');
+      return { ...s, targetType: 'campaign', targetName: d.campaign.name, before: { status: d.campaign.status }, after: { status: to } };
+    }
     case 'pause_adset':
     case 'activate_adset': {
       if (!adset) return asAdvice('הסט לא נמצא בקמפיין');
@@ -464,7 +471,7 @@ function validate(raw: any, d: CampaignData, idx: number): Suggestion {
   return base;
 }
 
-function parseJson(text: string): any {
+export function parseJson(text: string): any {
   try { return JSON.parse(text); } catch { /* try the outermost braces */ }
   const a = text.indexOf('{'), b = text.lastIndexOf('}');
   if (a >= 0 && b > a) { try { return JSON.parse(text.slice(a, b + 1)); } catch { /* fall through */ } }
@@ -707,7 +714,7 @@ export function registerOptimizerRoutes(app: express.Express) {
       const now = await readTarget(creds.token, ch.object_type, ch.object_id);
       if (!now.ok) return res.json({ success: false, error: metaErr(now.data) });
       // a new ad is undone by archiving it whatever its status became (someone may have turned it on)
-      if (ch.action !== 'create_ad' && !stillAsBefore(now.data, ch.after)) return res.json({ success: false, error: 'הערך השתנה שוב במטא מאז - לא בוטל' });
+      if (ch.action !== 'create_ad' && ch.action !== 'create_campaign' && !stillAsBefore(now.data, ch.after)) return res.json({ success: false, error: 'הערך השתנה שוב במטא מאז - לא בוטל' });
       const w = await writeTarget(creds.token, ch.object_type, ch.object_id, now.data, ch.before);
       const ok = w.ok && w.data?.success !== false;
       await p.query(
