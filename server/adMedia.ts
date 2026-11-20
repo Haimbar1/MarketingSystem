@@ -11,6 +11,7 @@
 // Meta decides each piece's size (start_offset → end_offset) and it can be bigger than Vercel's 4.5MB
 // body limit, so the browser sends 3MB pieces and the server keeps them in mk_video_uploads until
 // Meta's piece is complete, then transfers it.
+import { fixAssetRules } from './assetRules.js';
 import express from 'express';
 import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
 import { db, ensureTables } from './db.js';
@@ -422,6 +423,7 @@ export function registerAdMediaRoutes(app: express.Express) {
 
       const spec = creativeWithMedia(ad.data.creative, media, target);
       if ('error' in spec) return res.json({ success: false, error: spec.error });
+      if ((spec as any).asset_feed_spec) fixAssetRules((spec as any).asset_feed_spec);
       const what = target.action === 'remove' ? 'הסרת כרטיס' : media?.type === 'image' ? 'תמונה' : 'סרטון';
       const body: Record<string, string> = { name: `${ad.data.creative?.name || ad.data.name} · ${what} ${new Date().toLocaleDateString('he-IL')}`.slice(0, 200) };
       for (const [k, val] of Object.entries(spec)) if (val != null) body[k] = typeof val === 'string' ? val : JSON.stringify(val);

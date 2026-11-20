@@ -20,6 +20,7 @@ import { db, ensureTables } from './db.js';
 import { currentTenant, currentUser } from './tenant.js';
 import { gget, metaErr, ilsPerUnit, targetingSummary, parseJson } from './campaignOptimizer.js';
 import { creativeWithMedia, Media } from './adMedia.js';
+import { fixAssetRules } from './assetRules.js';
 
 const GRAPH = process.env.META_GRAPH_URL || 'https://graph.facebook.com/v21.0';
 const who = () => currentUser()?.email || 'unknown';
@@ -101,9 +102,13 @@ export function applyTexts(spec: any, texts: { bodies: string[]; titles: string[
   const titles = texts.titles.map(s => s.trim()).filter(Boolean);
   const descs = texts.descriptions.map(s => s.trim()).filter(Boolean);
   if (spec.asset_feed_spec) {
-    if (bodies.length) spec.asset_feed_spec.bodies = bodies.map(text => ({ text }));
-    if (titles.length) spec.asset_feed_spec.titles = titles.map(text => ({ text }));
-    if (descs.length) spec.asset_feed_spec.descriptions = descs.map(text => ({ text }));
+    const afs = spec.asset_feed_spec;
+    // the new texts take the old ones' places, labels included (placement rules point at them)
+    const keep = (old: any[] | undefined, list: string[]) => list.map((text, i) => (old?.[i]?.adlabels ? { text, adlabels: old[i].adlabels } : { text }));
+    if (bodies.length) afs.bodies = keep(afs.bodies, bodies);
+    if (titles.length) afs.titles = keep(afs.titles, titles);
+    if (descs.length) afs.descriptions = keep(afs.descriptions, descs);
+    fixAssetRules(afs);
     return spec;
   }
   const oss = spec.object_story_spec;
@@ -268,6 +273,9 @@ export function registerBuilderRoutes(app: express.Express) {
   });
 
   // 3. to Meta: a new campaign (PAUSED) with one ad set and its ads
+  app.post('/api/meta-ads/drafts/:id/retry-ads', async (req, res) => {
+    try { res.json(await retryFailedAds(Number(req.params.id))); } catch (e: any) { res.json({ success: false, error: e?.message || 'שגיאה' }); }
+  });
   app.post('/api/meta-ads/drafts/:id/publish', async (req, res) => {
     const out = await publishDraft(Number(req.params.id));
     res.status(out?.notFound ? 404 : 200).json(out);
@@ -409,56 +417,9 @@ export async function publishDraft(draftId: number): Promise<any> {
       steps.push('adset');
 
       // the ads - each base ad with the approved texts (and the new media)
-      const media: Media[] = [];
-      for (const m of draft.media) {
-        if (m.type === 'image' && m.hash) media.push({ type: 'image', hash: m.hash });
-        if (m.type === 'video' && m.id) {
-          const v = await gget(m.id, token, { fields: 'status,picture,thumbnails{uri,is_preferred}' });
-          const thumbs: any[] = v.data?.thumbnails?.data || [];
-          const thumb = (thumbs.find(t => t.is_preferred) || thumbs[0])?.uri || v.data?.picture || m.thumb || '';
-          if (v.data?.status?.video_status !== 'ready' || !thumb) return fail('סרטון עוד בעיבוד אצל מטא - נסו להעלות שוב בעוד דקה');
-          media.push({ type: 'video', id: m.id, thumb });
-        }
-      }
-      const created: { id: string; name: string }[] = [];
-      const errors: string[] = [];
-      const sources = base.baseAds.length ? base.baseAds : [];
-      for (const [i, ad] of sources.entries()) {
-        let spec: any;
-        if (media.length) {
-          const c = ad.creative || {};
-          if (c.asset_feed_spec) {
-            // a flexible ad: the new pictures / videos instead of its own
-            spec = { object_story_spec: c.object_story_spec, asset_feed_spec: JSON.parse(JSON.stringify(c.asset_feed_spec)) };
-            const imgs = media.filter(m => m.type === 'image') as { type: 'image'; hash: string }[];
-            const vids = media.filter(m => m.type === 'video') as { type: 'video'; id: string; thumb: string }[];
-            if (imgs.length) spec.asset_feed_spec.images = imgs.map(m => ({ hash: m.hash })); else delete spec.asset_feed_spec.images;
-            if (vids.length) spec.asset_feed_spec.videos = vids.map(m => ({ video_id: m.id, thumbnail_url: m.thumb })); else delete spec.asset_feed_spec.videos;
-            const fmts = [...(imgs.length ? ['SINGLE_IMAGE'] : []), ...(vids.length ? ['SINGLE_VIDEO'] : [])];
-            if (Array.isArray(spec.asset_feed_spec.ad_formats)) spec.asset_feed_spec.ad_formats = Array.from(new Set([...spec.asset_feed_spec.ad_formats.filter((f: string) => !/SINGLE_(IMAGE|VIDEO)/.test(f)), ...fmts]));
-            if (c.degrees_of_freedom_spec) spec.degrees_of_freedom_spec = c.degrees_of_freedom_spec;
-            if (c.url_tags) spec.url_tags = c.url_tags;
-          } else if (c.object_story_spec?.link_data?.child_attachments) {
-            spec = { object_story_spec: c.object_story_spec, url_tags: c.url_tags }; // a carousel keeps its own cards
-          } else {
-            const one = creativeWithMedia(c, media[i % media.length], { kind: 'single' });
-            if ('error' in one) { errors.push(`${ad.name}: ${one.error}`); continue; }
-            spec = one;
-          }
-        } else {
-          const c = ad.creative || {};
-          spec = { object_story_spec: c.object_story_spec, asset_feed_spec: c.asset_feed_spec, degrees_of_freedom_spec: c.degrees_of_freedom_spec, url_tags: c.url_tags };
-        }
-        spec = applyTexts(JSON.parse(JSON.stringify(spec)), draft.texts);
-        if (!spec.object_story_spec && !spec.asset_feed_spec) { errors.push(`${ad.name}: המודעה מבוססת על פוסט קיים - דילגנו`); continue; }
-        const crBody: Record<string, any> = { name: `${draft.name} - ${ad.name}`.slice(0, 200) };
-        for (const [k, v] of Object.entries(spec)) if (v != null) crBody[k] = v;
-        const cr = await post(`${accountId}/adcreatives`, token, crBody);
-        if (!cr.ok || !cr.data?.id) { errors.push(`${ad.name}: ${metaErr(cr.data)}`); continue; }
-        const na = await post(`${accountId}/ads`, token, { name: `${ad.name}`.slice(0, 200), adset_id: adsetId, creative: { creative_id: String(cr.data.id) }, status: 'ACTIVE' });
-        if (!na.ok || !na.data?.id) { errors.push(`${ad.name}: ${metaErr(na.data)}`); continue; }
-        created.push({ id: String(na.data.id), name: ad.name });
-      }
+      const media = await draftMedia(draft, token);
+      if (typeof media === 'string') return fail(media);
+      const { created, errors } = await buildAds(draft, base, media, token, accountId, adsetId);
       if (!created.length) return fail(`לא נוצרה אף מודעה: ${errors.join(' · ') || 'אין מודעות בסט הבסיס'}`);
       steps.push('ads');
       const published = { campaignId, adsetId, ads: created, errors, at: new Date().toISOString() };
@@ -468,4 +429,82 @@ export async function publishDraft(draftId: number): Promise<any> {
       console.error('[builder publish]', e?.message);
       return ({ success: false, error: e?.message || 'שגיאה' });
     }
+}
+
+// the ads of a new ad set: each base ad as a new creative with the approved texts (and the new media)
+async function buildAds(draft: Draft, base: Base, media: Media[], token: string, accountId: string, adsetId: string, only?: (ad: any) => boolean) {
+  const created: { id: string; name: string }[] = [];
+  const errors: string[] = [];
+  const sources = (base.baseAds.length ? base.baseAds : []).filter((a: any) => !only || only(a));
+  for (const [i, ad] of sources.entries()) {
+    let spec: any;
+    if (media.length) {
+      const c = ad.creative || {};
+      if (c.asset_feed_spec) {
+        // a flexible ad: the new pictures / videos instead of its own
+        spec = { object_story_spec: c.object_story_spec, asset_feed_spec: JSON.parse(JSON.stringify(c.asset_feed_spec)) };
+        const imgs = media.filter(m => m.type === 'image') as { type: 'image'; hash: string }[];
+        const vids = media.filter(m => m.type === 'video') as { type: 'video'; id: string; thumb: string }[];
+        if (imgs.length) spec.asset_feed_spec.images = imgs.map(m => ({ hash: m.hash })); else delete spec.asset_feed_spec.images;
+        if (vids.length) spec.asset_feed_spec.videos = vids.map(m => ({ video_id: m.id, thumbnail_url: m.thumb })); else delete spec.asset_feed_spec.videos;
+        const fmts = [...(imgs.length ? ['SINGLE_IMAGE'] : []), ...(vids.length ? ['SINGLE_VIDEO'] : [])];
+        if (Array.isArray(spec.asset_feed_spec.ad_formats)) spec.asset_feed_spec.ad_formats = Array.from(new Set([...spec.asset_feed_spec.ad_formats.filter((f: string) => !/SINGLE_(IMAGE|VIDEO)/.test(f)), ...fmts]));
+        if (c.degrees_of_freedom_spec) spec.degrees_of_freedom_spec = c.degrees_of_freedom_spec;
+        if (c.url_tags) spec.url_tags = c.url_tags;
+      } else if (c.object_story_spec?.link_data?.child_attachments) {
+        spec = { object_story_spec: c.object_story_spec, url_tags: c.url_tags }; // a carousel keeps its own cards
+      } else {
+        const one = creativeWithMedia(c, media[i % media.length], { kind: 'single' });
+        if ('error' in one) { errors.push(`${ad.name}: ${one.error}`); continue; }
+        spec = one;
+      }
+    } else {
+      const c = ad.creative || {};
+      spec = { object_story_spec: c.object_story_spec, asset_feed_spec: c.asset_feed_spec, degrees_of_freedom_spec: c.degrees_of_freedom_spec, url_tags: c.url_tags };
+    }
+    spec = applyTexts(JSON.parse(JSON.stringify(spec)), draft.texts);
+    if (!spec.object_story_spec && !spec.asset_feed_spec) { errors.push(`${ad.name}: המודעה מבוססת על פוסט קיים - דילגנו`); continue; }
+    const crBody: Record<string, any> = { name: `${draft.name} - ${ad.name}`.slice(0, 200) };
+    for (const [k, v] of Object.entries(spec)) if (v != null) crBody[k] = v;
+    const cr = await post(`${accountId}/adcreatives`, token, crBody);
+    if (!cr.ok || !cr.data?.id) { errors.push(`${ad.name}: ${metaErr(cr.data)}`); continue; }
+    const na = await post(`${accountId}/ads`, token, { name: `${ad.name}`.slice(0, 200), adset_id: adsetId, creative: { creative_id: String(cr.data.id) }, status: 'ACTIVE' });
+    if (!na.ok || !na.data?.id) { errors.push(`${ad.name}: ${metaErr(na.data)}`); continue; }
+    created.push({ id: String(na.data.id), name: ad.name });
+  }
+  return { created, errors };
+}
+
+async function draftMedia(draft: Draft, token: string): Promise<Media[] | string> {
+  const media: Media[] = [];
+  for (const m of draft.media) {
+    if (m.type === 'image' && m.hash) media.push({ type: 'image', hash: m.hash });
+    if (m.type === 'video' && m.id) {
+      const v = await gget(m.id, token, { fields: 'status,picture,thumbnails{uri,is_preferred}' });
+      const thumbs: any[] = v.data?.thumbnails?.data || [];
+      const thumb = (thumbs.find(t => t.is_preferred) || thumbs[0])?.uri || v.data?.picture || m.thumb || '';
+      if (v.data?.status?.video_status !== 'ready' || !thumb) return 'סרטון עוד בעיבוד אצל מטא - נסו להעלות שוב בעוד דקה';
+      media.push({ type: 'video', id: m.id, thumb });
+    }
+  }
+  return media;
+}
+
+// "🔁 לנסות שוב את המודעות שנכשלו": the base ads that didn't become ads, into the same ad set
+export async function retryFailedAds(draftId: number): Promise<any> {
+  const p = await ensureDraftTable();
+  const creds = await adsCredsForCurrentBusiness();
+  if (!creds) return { success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' };
+  const r = await p.query(`SELECT * FROM mk_drafts WHERE id = $1 AND tenant_id = $2`, [draftId, currentTenant()]);
+  const row = r.rows[0];
+  if (!row || row.status !== 'published' || !row.published?.adsetId) return { success: false, error: 'אין כאן סט מודעות להוסיף אליו' };
+  const draft: Draft = cleanDraft(row.draft, row.context);
+  const base = await readBase(creds, String(row.base_campaign_id));
+  const media = await draftMedia(draft, creds.token);
+  if (typeof media === 'string') return { success: false, error: media };
+  const done = new Set((row.published.ads || []).map((a: any) => String(a.name)));
+  const { created, errors } = await buildAds(draft, base, media, creds.token, creds.accountId, String(row.published.adsetId), (a: any) => !done.has(String(a.name)));
+  const published = { ...row.published, ads: [...(row.published.ads || []), ...created], errors };
+  await p.query(`UPDATE mk_drafts SET published = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify(published)]);
+  return { success: created.length > 0 || !errors.length, ...published, name: draft.name, added: created.length, error: !created.length && errors.length ? errors.join(' · ') : undefined };
 }

@@ -107,6 +107,14 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
     await fetch(`/api/meta-ads/${kind}/${id}`, { method: 'DELETE' }).catch(() => {});
     loadSaved();
   };
+  const retryAds = async () => {
+    if (!draftId) return;
+    setBusy('publish'); setError('');
+    const d = await fetch(`/api/meta-ads/drafts/${draftId}/retry-ads`, { method: 'POST' }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+    setBusy('');
+    if (d?.ads) setResult((r: any) => ({ ...(r || {}), ...d }));
+    if (!d?.success) setError(d?.error || 'הניסיון נכשל');
+  };
   const deletePublished = async (p: any) => {
     if (!window.confirm(`למחוק את הקמפיין "${p.name}" במטא, כולל הסטים והמודעות שבו?\n\nהמחיקה סופית - אי אפשר לשחזר.`)) return;
     const d = await fetch('/api/meta-ads/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'campaign', id: p.campaignId }) }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
@@ -255,6 +263,7 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
                   <div key={`p${p.draftId}`} className="flex flex-wrap items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
                     <span>⏸️ <b>{p.name}</b> · הועלה למטא ומושהה{p.dailyBudgetIls ? ` · ₪${p.dailyBudgetIls} ליום` : ''}</span>
                     <span className="flex gap-1">
+                      <button onClick={() => resumeDraft(p.draftId)} disabled={!!busy} className={btn}>פתח</button>
                       <button onClick={() => activateSaved(p)} disabled={!!busy} className="bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg px-2 py-1 disabled:opacity-50">▶️ להפעיל</button>
                       <button onClick={() => deletePublished(p)} disabled={!!busy} className={btn} title="מחק את הקמפיין במטא">🗑️</button>
                     </span>
@@ -405,7 +414,12 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
             <p className="text-green-800 bg-green-50 rounded-lg p-3 text-sm">
               ✓ הקמפיין "{result.name}" נוצר במטא {activated ? 'ופועל עכשיו' : 'מושהה'}, עם סט אחד ו-{result.ads.length} מודעות.
             </p>
-            {result.errors?.length ? <p className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2">חלק מהמודעות לא נוצרו: {result.errors.join(' · ')}</p> : null}
+            {result.errors?.length ? (
+              <div className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2 space-y-1.5">
+                <p>חלק מהמודעות לא נוצרו: {result.errors.join(' · ')}</p>
+                <button onClick={retryAds} disabled={!!busy} className="bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg px-3 py-1 disabled:opacity-50">{busy === 'publish' ? 'מנסה…' : '🔁 לנסות שוב את המודעות שנכשלו'}</button>
+              </div>
+            ) : null}
             {!activated ? (
               <button onClick={activate} disabled={busy === 'activate'} className="bg-green-600 hover:bg-green-700 text-white font-bold rounded-xl px-4 py-2 disabled:opacity-50">
                 {busy === 'activate' ? 'מפעיל…' : `▶️ להפעיל את הקמפיין (₪${draft?.dailyBudgetIls} ליום)`}

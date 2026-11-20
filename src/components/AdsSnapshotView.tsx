@@ -224,9 +224,11 @@ export default function AdsSnapshotView() {
 
   const campaigns = useMemo(() => {
     const list = snap?.campaigns.data || [];
-    const shown = showAll ? list : list.filter(c => c.effective_status === 'ACTIVE');
-    return [...shown].sort((a, b) => String(b.updated_time || '').localeCompare(String(a.updated_time || '')));
-  }, [snap, showAll]);
+    // a campaign made here shows even while paused (Haim, 2026-11-20 - a new one is uploaded paused and he couldn't find it)
+    const mine = (c: any) => ownCampaigns.includes(String(c.id)) && !['DELETED', 'ARCHIVED'].includes(String(c.effective_status));
+    const shown = showAll ? list : list.filter(c => c.effective_status === 'ACTIVE' || mine(c));
+    return [...shown].sort((a, b) => Number(mine(b)) - Number(mine(a)) || String(b.updated_time || '').localeCompare(String(a.updated_time || '')));
+  }, [snap, showAll, ownCampaigns]);
 
   const download = () => {
     if (!snap) return;
