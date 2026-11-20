@@ -21,6 +21,7 @@ import { currentTenant, currentUser } from './tenant.js';
 import { gget, metaErr, ilsPerUnit, targetingSummary, parseJson } from './campaignOptimizer.js';
 import { creativeWithMedia, Media } from './adMedia.js';
 import { fixAssetRules, cleanDof } from './assetRules.js';
+import { instagramIdFor, withInstagram, postCreative } from './instagram.js';
 import { tenantSecret } from './secrets.js';
 
 // ---------- the campaign's kind: where the ad leads (Haim, 2026-11-20 - "where is it set that it's a
@@ -512,7 +513,16 @@ export async function publishDraft(draftId: number): Promise<any> {
 }
 
 // the ads of a new ad set: each base ad as a new creative with the approved texts (and the new media)
+async function baseInstagram(base: Base, token: string): Promise<string> {
+  return instagramIdFor(token, {
+    oss: base.baseAds.map((a: any) => a.creative?.object_story_spec),
+    creativeIds: base.baseAds.map((a: any) => String(a.creative?.id || '')),
+    pageId: String(base.best?.promoted_object?.page_id || base.baseAds.map((a: any) => a.creative?.object_story_spec?.page_id).find(Boolean) || (await tenantSecret('FB_PAGE_ID').catch(() => '')) || ''),
+  });
+}
+
 async function buildAds(draft: Draft, base: Base, media: Media[], token: string, accountId: string, adsetId: string, only?: (ad: any) => boolean, whatsapp = false) {
+  const ig = await baseInstagram(base, token);
   const created: { id: string; name: string }[] = [];
   const errors: string[] = [];
   const sources = (base.baseAds.length ? base.baseAds : []).filter((a: any) => !only || only(a));
@@ -551,11 +561,12 @@ async function buildAds(draft: Draft, base: Base, media: Media[], token: string,
     }
     spec = applyTexts(JSON.parse(JSON.stringify(spec)), draft.texts);
     if (spec.degrees_of_freedom_spec !== undefined) spec.degrees_of_freedom_spec = cleanDof(spec.degrees_of_freedom_spec);
+    spec = withInstagram(spec, ig);
     if (whatsapp) spec = toWhatsAppSpec(spec);
     if (!spec.object_story_spec && !spec.asset_feed_spec) { errors.push(`${ad.name}: המודעה מבוססת על פוסט קיים - דילגנו`); continue; }
     const crBody: Record<string, any> = { name: `${draft.name} - ${ad.name}`.slice(0, 200) };
     for (const [k, v] of Object.entries(spec)) if (v != null) crBody[k] = v;
-    const cr = await post(`${accountId}/adcreatives`, token, crBody);
+    const cr = await postCreative(post, `${accountId}/adcreatives`, token, crBody);
     if (!cr.ok || !cr.data?.id) { errors.push(`${ad.name}: ${metaErr(cr.data)}`); continue; }
     const na = await post(`${accountId}/ads`, token, { name: `${ad.name}`.slice(0, 200), adset_id: adsetId, creative: { creative_id: String(cr.data.id) }, status: 'ACTIVE' });
     if (!na.ok || !na.data?.id) { errors.push(`${ad.name}: ${metaErr(na.data)}`); continue; }

@@ -12,6 +12,7 @@
 // body limit, so the browser sends 3MB pieces and the server keeps them in mk_video_uploads until
 // Meta's piece is complete, then transfers it.
 import { fixAssetRules, cleanDof } from './assetRules.js';
+import { instagramIdFor, withInstagram, postCreative } from './instagram.js';
 import express from 'express';
 import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
 import { db, ensureTables } from './db.js';
@@ -67,6 +68,8 @@ export type Target = { kind?: 'feed' | 'card' | 'single'; action?: 'add' | 'repl
 const MAX_CARDS = 10;
 
 const clone = (x: any) => (x == null ? x : JSON.parse(JSON.stringify(x)));
+
+const body0 = (spec: any) => !!spec?.object_story_spec;
 
 // The ad's creative with the new media. Returns an error text when not possible.
 export function creativeWithMedia(c: any, media: Media | null, target: Target = {}): CreativeSpec | { error: string } {
@@ -429,10 +432,13 @@ export function registerAdMediaRoutes(app: express.Express) {
       const spec = creativeWithMedia(ad.data.creative, media, target);
       if ('error' in spec) return res.json({ success: false, error: spec.error });
       if ((spec as any).asset_feed_spec) fixAssetRules((spec as any).asset_feed_spec);
+      const igOss = ad.data.creative?.object_story_spec;
+      const ig = await instagramIdFor(creds.token, { oss: [igOss], creativeIds: [String(ad.data.creative?.id || '')], pageId: String(igOss?.page_id || '') });
+      if (body0(spec)) withInstagram(spec, ig);
       const what = target.action === 'remove' ? 'הסרת כרטיס' : media?.type === 'image' ? 'תמונה' : 'סרטון';
       const body: Record<string, string> = { name: `${ad.data.creative?.name || ad.data.name} · ${what} ${new Date().toLocaleDateString('he-IL')}`.slice(0, 200) };
       for (const [k, val] of Object.entries(spec)) if (val != null) body[k] = typeof val === 'string' ? val : JSON.stringify(val);
-      const cr = await metaPost(`${creds.accountId}/adcreatives`, creds.token, body);
+      const cr = await postCreative(metaPost, `${creds.accountId}/adcreatives`, creds.token, body);
       if (!cr.ok || !cr.data?.id) return res.json({ success: false, error: `יצירת המודעה נכשלה: ${metaErr(cr.data)}` });
       const creativeId = String(cr.data.id);
       const log = (objectId: string, objectName: string, action: string, title: string, before: any, after: any, ok: boolean, error: string | null) =>
