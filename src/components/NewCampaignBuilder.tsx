@@ -14,16 +14,18 @@ type Draft = {
   genders: 'all' | 'female' | 'male' | null; advantageAudience: boolean | null;
   texts: { bodies: string[]; titles: string[]; descriptions: string[] };
   media: { type: 'video' | 'image'; id?: string; hash?: string; thumb?: string; name?: string }[];
+  kind?: 'whatsapp' | 'lead_form' | null;
   explanation?: string;
 };
 type Ctx = {
   baseName: string; baseAdsetName: string; objective: string; cbo: boolean; currency: string; rate: number | null;
   baseDailyIls: number | null; minDailyIls: number | null; bestLeads30: number; baseAdvantage: boolean;
-  baseTargeting: any; baseAds: { id: string; name: string; bodies: string[]; titles: string[] }[]; optimizationGoal: string; valueRuleSet: string | null;
+  baseTargeting: any; kind?: string; baseAds: { id: string; name: string; bodies: string[]; titles: string[] }[]; optimizationGoal: string; valueRuleSet: string | null;
 };
-type Base = { id: string; name: string; status: string; spend30: number; leads30: number };
+type Base = { id: string; name: string; status: string; spend30: number; leads30: number; kind?: string };
 
 const TYPE_HE: Record<string, string> = { city: 'עיר', region: 'אזור', country: 'מדינה' };
+const KIND_HE: Record<string, string> = { lead_form: '📋 טופס לידים', whatsapp: '💬 וואטסאפ', website: '🌐 אתר', messenger: '💬 מסנג׳ר', other: 'אחר' };
 const OBJ_HE: Record<string, string> = { OUTCOME_LEADS: 'לידים', OUTCOME_SALES: 'מכירות', OUTCOME_TRAFFIC: 'תנועה', OUTCOME_ENGAGEMENT: 'מעורבות', OUTCOME_AWARENESS: 'מודעות' };
 
 export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
@@ -223,7 +225,7 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
                 <span className="text-gray-600">על בסיס הקמפיין:</span>
                 {bases ? (
                   <select value={baseId} onChange={e => setBaseId(e.target.value)} disabled={!!busy} className={`${input} max-w-full`}>
-                    {bases.map(b => <option key={b.id} value={b.id}>{b.name} · {b.leads30} לידים ב-30 יום</option>)}
+                    {bases.map(b => <option key={b.id} value={b.id}>{b.name} · {KIND_HE[b.kind || ''] || ''} · {b.leads30} לידים ב-30 יום</option>)}
                   </select>
                 ) : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
               </div>
@@ -295,6 +297,14 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
               מבוסס על "{ctx.baseName}" ← הסט "{ctx.baseAdsetName}" ({ctx.bestLeads30} לידים ב-30 יום): מטרה {OBJ_HE[ctx.objective] || ctx.objective}, אותו טופס / אופטימיזציה, אותם מיקומי מודעה{ctx.valueRuleSet ? ', אותם כללי ערך למיקום' : ''}, אותם קהלים ותחומי עניין. משתנה רק מה שמופיע כאן.
             </p>
 
+            <div className="flex flex-wrap items-center gap-2 text-xs bg-blue-50 border border-blue-200 rounded-lg p-2">
+              <span className="font-bold text-gray-700">לאן המודעה מובילה:</span>
+              <select value={draft.kind && draft.kind !== ctx.kind ? draft.kind : ''} onChange={e => patch({ kind: (e.target.value || null) as any })} className={input}>
+                <option value="">{KIND_HE[ctx.kind || ''] || 'כמו בבסיס'} (כמו בקמפיין הבסיס)</option>
+                {ctx.kind !== 'whatsapp' && <option value="whatsapp">💬 וואטסאפ - שיחה עם הבוט במספר של העסק</option>}
+              </select>
+              {draft.kind === 'whatsapp' && ctx.kind !== 'whatsapp' && <span className="text-amber-700">המודעות יובילו לשיחה בוואטסאפ במקום ל{KIND_HE[ctx.kind || ''] || 'מה שבבסיס'}. זה הקמפיין הראשון שנבנה כך - נבדוק אותו בהעלאה.</span>}
+            </div>
             <div className="grid sm:grid-cols-2 gap-2 text-xs">
               <label className="space-y-0.5"><span className="text-gray-600">שם הקמפיין</span>
                 <input value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} onBlur={() => save(draft)} className={`${input} w-full`} /></label>

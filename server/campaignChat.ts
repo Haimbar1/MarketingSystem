@@ -25,7 +25,7 @@ import { db, ensureTables } from './db.js';
 import { aiJson } from './ai.js';
 import { currentTenant, currentUser, runWithTenant, OPTICS_TENANT } from './tenant.js';
 import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
-import { listBases, createDraft, publishDraft, readBase, contextOf, cleanDraft, draftProblems, searchPlaces, type Draft } from './campaignBuilder.js';
+import { listBases, createDraft, publishDraft, readBase, contextOf, cleanDraft, draftProblems, searchPlaces, KIND_HE, type Draft, type Kind } from './campaignBuilder.js';
 import { manualChange, parseJson } from './campaignOptimizer.js';
 
 const BOTAPP_URL = (process.env.BOTAPP_URL || 'https://app.smartesek.com').replace(/\/$/, '');
@@ -168,6 +168,7 @@ export function draftSummary(id: number, d: Draft, ctx: any, problems: string[])
   const lines = [
     `✨ *טיוטת קמפיין: ${d.name}*`,
     `• מבוסס על: "${ctx.baseName}" (${ctx.bestLeads30} לידים ב-30 יום)`,
+    `• סוג: *${d.kind && d.kind !== ctx.kind ? `${KIND_HE[d.kind as Kind]}* (במקום ${KIND_HE[ctx.kind as Kind] || 'הבסיס'})` : `${KIND_HE[ctx.kind as Kind] || 'כמו בבסיס'}*`}`,
     `• תקציב: *₪${d.dailyBudgetIls} ליום*`,
     `• מיקום: ${places}`,
     `• גיל: ${age}${d.genders ? ` · ${GENDER_HE[d.genders]}` : ''}`,
@@ -190,6 +191,7 @@ const BRIEF_SYSTEM = `אתה נועם, העוזר השיווקי של העסק. 
 בכל תשובה: מסכמים בקצרה מה הבנת עד עכשיו, ושואלים רק על מה שבאמת לא ברור או סותר (עד 3 שאלות, החשובה ראשונה).
 מה צריך להיות ברור לפני בנייה:
 - על בסיס איזה קמפיין (מהרשימה bases; אם לא נאמר - הקמפיין עם הכי הרבה לידים, ותגיד את זה).
+- סוג הקמפיין = לאן המודעה מובילה (kind): lead_form = טופס לידים בפייסבוק, whatsapp = שיחה בוואטסאפ של העסק (הבוט עונה), website = אתר. תמיד לכתוב בסיכום את הסוג. אם בעל העסק מבקש סוג אחר מ-base.kind (למשל "וואטסאפ" כשהבסיס טופס לידים) - להגיד את זה במפורש: אם יש ב-bases קמפיין מהסוג שביקש - להציע אותו כבסיס (understood.baseCampaignId); אחרת - להגיד שנבנה כמו הבסיס אבל המודעות יובילו לוואטסאפ (understood.kind = "whatsapp"), ושזה הקמפיין הראשון כזה ונבדוק אותו בהעלאה. מעבר לטופס לידים אפשר רק מבסיס של טופס לידים. השם של הקמפיין לא קובע את הסוג.
 - איפה (ערים / אזורים, רדיוס אם נאמר). אם לא נאמר - כמו בבסיס, ותגיד מה זה.
 - תקציב יומי בשקלים. אם לא נאמר - כמו בבסיס (base.baseDailyIls), ותגיד.
 - גיל / מגדר - רק אם נאמר משהו או שזה חשוב להצעה.
@@ -201,7 +203,7 @@ build = true רק כשבעל העסק מאשר עכשיו לבנות (כן / מ�
 cancel = true כשהוא מבקש לעזוב / לבטל את הקמפיין.
 offTopic = true כשההודעה בכלל לא קשורה לקמפיין (למשל שאלה של לקוח, בדיקה של הבוט).
 reply: קצר, עברית טבעית, בלי מגדר, מתאים לוואטסאפ: *מודגש* לכותרות, "•" לרשימות.
-החזר JSON בלבד: { "reply", "understood": { "baseCampaignId", "baseCampaignName", "places": [{ "name", "radiusKm" }] או null, "dailyBudgetIls" או null, "ageMin", "ageMax", "genders" ("all"|"female"|"male"|null), "offer", "emphasis", "media", "other" }, "questions": [], "ready", "build", "cancel", "offTopic" }`;
+החזר JSON בלבד: { "reply", "understood": { "baseCampaignId", "baseCampaignName", "kind" ("whatsapp"|"lead_form"|null = כמו בבסיס), "places": [{ "name", "radiusKm" }] או null, "dailyBudgetIls" או null, "ageMin", "ageMax", "genders" ("all"|"female"|"male"|null), "offer", "emphasis", "media", "other" }, "questions": [], "ready", "build", "cancel", "offTopic" }`;
 
 type Brief = { id: number; status: string; messages: { role: 'owner' | 'bot'; text: string; at: string }[]; understood: any; ready: boolean; base_campaign_id: string | null; draft_id: number | null; channel: string; phone: string | null };
 
@@ -242,8 +244,8 @@ export async function briefTurn(input: { briefId?: number | null; text: string; 
   const history = brief?.messages || [];
   const ai = await aiJson(BRIEF_SYSTEM, JSON.stringify({
     today: new Date().toISOString().slice(0, 10),
-    bases: bases.campaigns.slice(0, 10).map((c: any) => ({ id: c.id, name: c.name, leads30: c.leads30, spend30: c.spend30, status: c.status })),
-    base: base && !base.error ? { id: baseId, name: base.baseName, adset: base.baseAdsetName, dailyIls: base.baseDailyIls, targeting: base.baseTargeting, texts: base.baseAds?.map((a: any) => a.bodies?.[0]).filter(Boolean).slice(0, 3) } : null,
+    bases: bases.campaigns.slice(0, 10).map((c: any) => ({ id: c.id, name: c.name, kind: c.kind, leads30: c.leads30, spend30: c.spend30, status: c.status })),
+    base: base && !base.error ? { id: baseId, name: base.baseName, kind: base.kind, adset: base.baseAdsetName, dailyIls: base.baseDailyIls, targeting: base.baseTargeting, texts: base.baseAds?.map((a: any) => a.bodies?.[0]).filter(Boolean).slice(0, 3) } : null,
     understoodSoFar: brief?.understood || null,
     lastSummaryWasReady: !!brief?.ready,
     conversation: history.slice(-16),
@@ -293,7 +295,7 @@ export async function buildFromBrief(briefId: number): Promise<any> {
 
 const EDIT_SYSTEM = `בעל העסק ענה על סיכום טיוטת קמפיין או על שאלת "להפעיל?". סווג את ההודעה.
 intent: "confirm" (מאשר את מה שנשאל), "decline" (לא עכשיו / לא לאשר), "edit" (רוצה לשנות משהו בטיוטה), "new" (רוצה קמפיין אחר / חדש), "other" (לא קשור לקמפיין).
-edits (רק ב-edit, רק מה שנאמר): { "dailyBudgetIls", "ageMin", "ageMax", "genders" ("all"|"female"|"male"), "advantageAudience" (true/false), "addPlaces": [{ "name", "radiusKm" }], "removePlaces": [שמות], "name", "bodies": [טקסטים חדשים], "titles": [כותרות חדשות] }.
+edits (רק ב-edit, רק מה שנאמר): { "kind" ("whatsapp" | "lead_form"), "dailyBudgetIls", "ageMin", "ageMax", "genders" ("all"|"female"|"male"), "advantageAudience" (true/false), "addPlaces": [{ "name", "radiusKm" }], "removePlaces": [שמות], "name", "bodies": [טקסטים חדשים], "titles": [כותרות חדשות] }.
 החזר JSON בלבד: { "intent", "edits" }`;
 
 async function classifyAnswer(text: string, prompt: any, draft: Draft | null): Promise<{ intent: string; edits?: any }> {
@@ -311,7 +313,7 @@ async function applyEdits(draftId: number, edits: any): Promise<{ ok: boolean; m
   if (!row || row.status !== 'draft') return { ok: false, msg: { text: 'הטיוטה הזו כבר הועלתה - אי אפשר לשנות אותה מכאן.' }, unmatched: [] };
   const d: any = JSON.parse(JSON.stringify(row.draft));
   const e = edits || {};
-  for (const k of ['dailyBudgetIls', 'ageMin', 'ageMax', 'genders', 'advantageAudience', 'name']) if (e[k] != null && e[k] !== '') d[k] = e[k];
+  for (const k of ['dailyBudgetIls', 'ageMin', 'ageMax', 'genders', 'advantageAudience', 'name', 'kind']) if (e[k] != null && e[k] !== '') d[k] = e[k];
   if (Array.isArray(e.bodies) && e.bodies.length) d.texts.bodies = e.bodies;
   if (Array.isArray(e.titles) && e.titles.length) d.texts.titles = e.titles;
   const unmatched: string[] = [];

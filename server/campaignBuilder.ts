@@ -21,6 +21,47 @@ import { currentTenant, currentUser } from './tenant.js';
 import { gget, metaErr, ilsPerUnit, targetingSummary, parseJson } from './campaignOptimizer.js';
 import { creativeWithMedia, Media } from './adMedia.js';
 import { fixAssetRules } from './assetRules.js';
+import { tenantSecret } from './secrets.js';
+
+// ---------- the campaign's kind: where the ad leads (Haim, 2026-11-20 - "where is it set that it's a
+// WhatsApp campaign?": a draft named "וואטסאפ" was a lead-form campaign, copied from a lead-form base) ----------
+export type Kind = 'lead_form' | 'whatsapp' | 'website' | 'messenger' | 'other';
+export const KIND_HE: Record<Kind, string> = { lead_form: '📋 טופס לידים', whatsapp: '💬 וואטסאפ', website: '🌐 אתר', messenger: '💬 מסנג׳ר', other: 'אחר' };
+const ctasOf = (ads: any[]) => ads.flatMap((a: any) => {
+  const c = a?.creative || {};
+  const oss = c.object_story_spec || {};
+  return [oss.video_data?.call_to_action, oss.link_data?.call_to_action, ...(oss.link_data?.child_attachments || []).map((x: any) => x?.call_to_action),
+    ...(c.asset_feed_spec?.call_to_action_types || []).map((t: string) => ({ type: t }))].filter(Boolean);
+});
+export function kindOf(adset: any, ads: any[] = []): Kind {
+  const dt = String(adset?.destination_type || '').toUpperCase();
+  const ctas = ctasOf(ads);
+  if (dt === 'WHATSAPP' || ctas.some((c: any) => c.type === 'WHATSAPP_MESSAGE' || c.value?.app_destination === 'WHATSAPP')) return 'whatsapp';
+  if (dt === 'MESSENGER' || ctas.some((c: any) => c.type === 'MESSAGE_PAGE')) return 'messenger';
+  if (dt === 'ON_AD' || ctas.some((c: any) => c.value?.lead_gen_form_id) || (!dt && adset?.optimization_goal === 'LEAD_GENERATION')) return 'lead_form';
+  if (dt === 'WEBSITE' || ctas.some((c: any) => c.value?.link && !/fb\.me/.test(String(c.value.link)))) return 'website';
+  return 'other';
+}
+
+// A copied creative led to WhatsApp instead of a form / site: "שלח הודעה בוואטסאפ" (click-to-WhatsApp)
+const WA_LINK = 'https://api.whatsapp.com/send';
+const waCta = () => ({ type: 'WHATSAPP_MESSAGE', value: { app_destination: 'WHATSAPP', link: WA_LINK } });
+export function toWhatsAppSpec(spec: any): any {
+  const oss = spec.object_story_spec;
+  if (oss?.video_data) oss.video_data.call_to_action = waCta();
+  if (oss?.link_data) {
+    oss.link_data.link = WA_LINK;
+    oss.link_data.call_to_action = waCta();
+    for (const card of oss.link_data.child_attachments || []) { card.link = WA_LINK; card.call_to_action = waCta(); }
+  }
+  if (spec.asset_feed_spec) {
+    const afs = spec.asset_feed_spec;
+    afs.call_to_action_types = ['WHATSAPP_MESSAGE'];
+    afs.link_urls = [{ website_url: WA_LINK }];
+    delete afs.call_to_actions;
+  }
+  return spec;
+}
 
 const GRAPH = process.env.META_GRAPH_URL || 'https://graph.facebook.com/v21.0';
 const who = () => currentUser()?.email || 'unknown';
@@ -137,6 +178,7 @@ export type Draft = {
   advantageAudience: boolean | null; // null = as the base
   texts: { bodies: string[]; titles: string[]; descriptions: string[] };
   media: { type: 'video' | 'image'; id?: string; hash?: string; thumb?: string }[]; // empty = the base ads' media
+  kind?: 'whatsapp' | 'lead_form' | null; // null = as the base (where the ad leads)
   explanation?: string;
 };
 
@@ -156,6 +198,7 @@ export function cleanDraft(raw: any, ctx: any): Draft {
     texts: { bodies: list(raw?.texts?.bodies, 5), titles: list(raw?.texts?.titles, 5).map(s => s.slice(0, 120)), descriptions: list(raw?.texts?.descriptions, 3).map(s => s.slice(0, 200)) },
     media: (Array.isArray(raw?.media) ? raw.media : []).filter((m: any) => (m?.type === 'video' && m.id) || (m?.type === 'image' && m.hash)).slice(0, 10)
       .map((m: any) => ({ type: m.type, id: m.id ? String(m.id).replace(/\D/g, '') : undefined, hash: m.hash ? String(m.hash).replace(/[^\w]/g, '') : undefined, thumb: m.thumb ? String(m.thumb) : undefined })),
+    kind: ['whatsapp', 'lead_form'].includes(raw?.kind) && raw.kind !== ctx?.kind ? raw.kind : null,
     explanation: raw?.explanation ? String(raw.explanation).slice(0, 1500) : undefined,
   };
   if (d.ageMin && d.ageMax && d.ageMin > d.ageMax) [d.ageMin, d.ageMax] = [d.ageMax, d.ageMin];
@@ -170,6 +213,7 @@ export function draftProblems(d: Draft, ctx: any): string[] {
   if (adv && d.ageMax && d.ageMax < 65) out.push('עם Advantage+ קהל מטא לא מאפשרת גיל מקסימום מתחת ל-65 - כבו את Advantage+ או השאירו 65');
   if (!d.texts.bodies.length) out.push('חסר טקסט למודעה');
   if (ctx.minDailyIls && d.dailyBudgetIls < ctx.minDailyIls) out.push(`התקציב היומי נמוך מהמינימום של מטא (₪${ctx.minDailyIls})`);
+  if (d.kind === 'lead_form' && ctx.kind !== 'lead_form') out.push('מעבר לטופס לידים צריך טופס - בחרו קמפיין בסיס של טופס לידים (או השאירו את הסוג כמו בבסיס)');
   if (!ctx.baseAds?.length && !d.media.length) out.push('לסט הבסיס אין מודעות פעילות - צריך להעלות תמונה או סרטון');
   return out;
 }
@@ -184,7 +228,8 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta לעסק ק�
 - name: שם קצר לקמפיין בעברית (מה, איפה, תאריך).
 - explanation: 2-4 משפטים: מה לקחת מהבסיס ומה שינית ולמה.
 אם יש agreed - זה מה שסוכם עם בעל העסק בשיחה לפני הבנייה (מיקום, תקציב, גיל, מסר...): לבנות בדיוק לפיו ולא לשנות דבר שסוכם.
-החזר JSON בלבד: { "name", "dailyBudgetIls", "places", "ageMin", "ageMax", "genders", "texts": { "bodies": [], "titles": [], "descriptions": [] }, "explanation" }`;
+- kind: "whatsapp" אם ההוראה (או agreed.kind) מבקשת שהמודעה תוביל לשיחה בוואטסאפ ו-base.kind אחר; אחרת null (כמו בבסיס).
+החזר JSON בלבד: { "name", "kind", "dailyBudgetIls", "places", "ageMin", "ageMax", "genders", "texts": { "bodies": [], "titles": [], "descriptions": [] }, "explanation" }`;
 
 // ---------- reading the base ----------
 
@@ -238,6 +283,7 @@ export function contextOf(b: Base) {
     baseTargeting: targetingSummary(b.best.targeting), baseAdvantage: b.best.targeting?.targeting_automation?.advantage_audience === 1,
     baseAds: b.baseAds.map(a => ({ id: String(a.id), name: a.name, ...adTexts(a) })),
     optimizationGoal: b.best.optimization_goal, valueRuleSet: b.best.value_rule_set_id || null,
+    kind: kindOf(b.best, b.baseAds),
   };
 }
 
@@ -286,13 +332,16 @@ export async function listBases(): Promise<any> {
     try {
       const creds = await adsCredsForCurrentBusiness();
       if (!creds) return ({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
-      const [camps, ins] = await Promise.all([
+      const [camps, ins, sets] = await Promise.all([
         gget(`${creds.accountId}/campaigns`, creds.token, { fields: 'id,name,objective,effective_status', limit: '100' }),
         gget(`${creds.accountId}/insights`, creds.token, { level: 'campaign', date_preset: 'last_30d', fields: 'campaign_id,spend,actions', limit: '200' }),
+        gget(`${creds.accountId}/adsets`, creds.token, { fields: 'campaign_id,destination_type,optimization_goal', limit: '300' }),
       ]);
+      const kinds = new Map<string, Kind>();
+      for (const st of (sets.ok ? sets.data?.data || [] : [])) if (!kinds.has(String(st.campaign_id))) kinds.set(String(st.campaign_id), kindOf(st));
       if (!camps.ok) return ({ success: false, error: metaErr(camps.data) });
       const by = new Map<string, any>((ins.ok ? ins.data?.data || [] : []).map((r: any) => [String(r.campaign_id), r]));
-      const list = (camps.data?.data || []).map((c: any) => ({ id: String(c.id), name: c.name, objective: c.objective, status: c.effective_status, spend30: Number(by.get(String(c.id))?.spend) || 0, leads30: leadsOf(by.get(String(c.id))) }))
+      const list = (camps.data?.data || []).map((c: any) => ({ id: String(c.id), name: c.name, objective: c.objective, status: c.effective_status, spend30: Number(by.get(String(c.id))?.spend) || 0, leads30: leadsOf(by.get(String(c.id))), kind: kinds.get(String(c.id)) || 'other' }))
         .sort((a: any, b: any) => b.leads30 - a.leads30 || b.spend30 - a.spend30);
       return ({ success: true, campaigns: list });
     } catch (e: any) {
@@ -327,6 +376,7 @@ export async function createDraft(input: { instruction: string; baseCampaignId?:
         }
         raw.places = found;
       }
+      if (input.understood && ['whatsapp', 'lead_form'].includes(input.understood.kind)) raw.kind = input.understood.kind;
       const draft = cleanDraft(raw, ctx);
       const p = await ensureDraftTable();
       const ins = await p.query(
@@ -398,6 +448,7 @@ export async function publishDraft(draftId: number): Promise<any> {
 
       // the ad set - a copy of the base's best one with the approved targeting / budget
       const b = base.best;
+      let noRules = false;
       const setBody: Record<string, any> = {
         name: `${draft.name} - סט`, campaign_id: campaignId, status: 'ACTIVE',
         optimization_goal: b.optimization_goal, billing_event: b.billing_event, targeting: applyTargeting(b.targeting, draft),
@@ -411,7 +462,24 @@ export async function publishDraft(draftId: number): Promise<any> {
       if (b.value_rule_set_id && b.value_rules_applied !== false) { setBody.value_rule_set_id = String(b.value_rule_set_id); setBody.value_rules_applied = true; }
       if (b.dsa_beneficiary) setBody.dsa_beneficiary = b.dsa_beneficiary;
       if (b.dsa_payor) setBody.dsa_payor = b.dsa_payor;
-      const set = await post(`${accountId}/adsets`, token, setBody);
+      // the kind: from the base, or switched to WhatsApp as approved (a lead form needs a lead-form base)
+      const toKind = draft.kind && draft.kind !== ctx.kind ? draft.kind : null;
+      if (toKind === 'whatsapp') {
+        const pageId = String(b.promoted_object?.page_id || base.baseAds.map((a: any) => a.creative?.object_story_spec?.page_id).find(Boolean) || (await tenantSecret('FB_PAGE_ID')) || '');
+        if (!pageId) return fail('למעבר לוואטסאפ צריך את דף הפייסבוק של העסק (FB_PAGE_ID בפורטל)');
+        setBody.destination_type = 'WHATSAPP';
+        setBody.optimization_goal = 'CONVERSATIONS';
+        setBody.billing_event = 'IMPRESSIONS';
+        setBody.promoted_object = { page_id: pageId };
+        delete setBody.attribution_spec; // a lead form's attribution doesn't fit a conversation
+      }
+      let set = await post(`${accountId}/adsets`, token, setBody);
+      if (!set.ok && toKind && setBody.value_rule_set_id) {
+        // placement value rules may not fit the new kind - once more without them (said in the result)
+        const { value_rule_set_id: _v, value_rules_applied: _a, ...rest } = setBody;
+        const again = await post(`${accountId}/adsets`, token, rest);
+        if (again.ok) { set = again; noRules = true; }
+      }
       if (!set.ok || !set.data?.id) return fail(`יצירת סט המודעות נכשלה: ${metaErr(set.data)}`);
       const adsetId = String(set.data.id);
       steps.push('adset');
@@ -419,7 +487,8 @@ export async function publishDraft(draftId: number): Promise<any> {
       // the ads - each base ad with the approved texts (and the new media)
       const media = await draftMedia(draft, token);
       if (typeof media === 'string') return fail(media);
-      const { created, errors } = await buildAds(draft, base, media, token, accountId, adsetId);
+      const { created, errors } = await buildAds(draft, base, media, token, accountId, adsetId, undefined, toKind === 'whatsapp');
+      if (noRules) errors.push('כללי הערך למיקום לא התאימו לקמפיין וואטסאפ - הסט נוצר בלעדיהם');
       if (!created.length) return fail(`לא נוצרה אף מודעה: ${errors.join(' · ') || 'אין מודעות בסט הבסיס'}`);
       steps.push('ads');
       const published = { campaignId, adsetId, ads: created, errors, at: new Date().toISOString() };
@@ -432,7 +501,7 @@ export async function publishDraft(draftId: number): Promise<any> {
 }
 
 // the ads of a new ad set: each base ad as a new creative with the approved texts (and the new media)
-async function buildAds(draft: Draft, base: Base, media: Media[], token: string, accountId: string, adsetId: string, only?: (ad: any) => boolean) {
+async function buildAds(draft: Draft, base: Base, media: Media[], token: string, accountId: string, adsetId: string, only?: (ad: any) => boolean, whatsapp = false) {
   const created: { id: string; name: string }[] = [];
   const errors: string[] = [];
   const sources = (base.baseAds.length ? base.baseAds : []).filter((a: any) => !only || only(a));
@@ -463,6 +532,7 @@ async function buildAds(draft: Draft, base: Base, media: Media[], token: string,
       spec = { object_story_spec: c.object_story_spec, asset_feed_spec: c.asset_feed_spec, degrees_of_freedom_spec: c.degrees_of_freedom_spec, url_tags: c.url_tags };
     }
     spec = applyTexts(JSON.parse(JSON.stringify(spec)), draft.texts);
+    if (whatsapp) spec = toWhatsAppSpec(spec);
     if (!spec.object_story_spec && !spec.asset_feed_spec) { errors.push(`${ad.name}: המודעה מבוססת על פוסט קיים - דילגנו`); continue; }
     const crBody: Record<string, any> = { name: `${draft.name} - ${ad.name}`.slice(0, 200) };
     for (const [k, v] of Object.entries(spec)) if (v != null) crBody[k] = v;
@@ -503,7 +573,8 @@ export async function retryFailedAds(draftId: number): Promise<any> {
   const media = await draftMedia(draft, creds.token);
   if (typeof media === 'string') return { success: false, error: media };
   const done = new Set((row.published.ads || []).map((a: any) => String(a.name)));
-  const { created, errors } = await buildAds(draft, base, media, creds.token, creds.accountId, String(row.published.adsetId), (a: any) => !done.has(String(a.name)));
+  const toWa = draft.kind === 'whatsapp' && kindOf(base.best, base.baseAds) !== 'whatsapp';
+  const { created, errors } = await buildAds(draft, base, media, creds.token, creds.accountId, String(row.published.adsetId), (a: any) => !done.has(String(a.name)), toWa);
   const published = { ...row.published, ads: [...(row.published.ads || []), ...created], errors };
   await p.query(`UPDATE mk_drafts SET published = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify(published)]);
   return { success: created.length > 0 || !errors.length, ...published, name: draft.name, added: created.length, error: !created.length && errors.length ? errors.join(' · ') : undefined };
