@@ -491,6 +491,8 @@ export function stillAsBefore(obj: any, before: Record<string, any>): boolean {
     if (k === 'age_min' || k === 'age_max') return num(obj?.targeting?.[k] || (k === 'age_min' ? 18 : 65)) === num(v);
     if (k === 'daily_budget') return num(obj?.[k]) === num(v);
     if (k === 'creative_id') return String(obj?.creative?.id ?? '') === String(v ?? '');
+    // location / gender (bulk "📍 מיקום ומגדר"): compared on those two only - Meta adds its own keys to targeting
+    if (k === 'targeting') { const pick = (t: any) => JSON.stringify({ g: t?.geo_locations?.cities || t?.geo_locations?.regions || t?.geo_locations?.countries || null, s: t?.genders || null }); return pick(obj?.targeting) === pick(v); }
     return String(obj?.[k] ?? '') === String(v ?? '');
   });
 }
@@ -506,6 +508,7 @@ export async function writeTarget(token: string, type: string, id: string, curre
     if ('age_max' in values) t.age_max = values.age_max;
     body.targeting = JSON.stringify(t);
   }
+  if ('targeting' in values && values.targeting) body.targeting = JSON.stringify(values.targeting);
   if ('value_rule_set_id' in values) {
     if (values.value_rule_set_id) { body.value_rule_set_id = String(values.value_rule_set_id); body.value_rules_applied = 'true'; }
     else body.value_rules_applied = 'false';

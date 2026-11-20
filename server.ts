@@ -13,6 +13,7 @@ import { registerAdMediaRoutes } from './server/adMedia.js';
 import { registerBuilderRoutes } from './server/campaignBuilder.js';
 import { registerChatRoutes, registerBotRoutes } from './server/campaignChat.js';
 import { registerDeleteRoutes } from './server/deleteObjects.js';
+import { registerAdEditRoutes } from './server/adEdits.js';
 
 const requestHost = (req: express.Request) =>
   String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
@@ -61,6 +62,7 @@ export async function createApp({ serveFrontend }: { serveFrontend: boolean }) {
   registerBuilderRoutes(app);
   registerChatRoutes(app);
   registerDeleteRoutes(app);
+  registerAdEditRoutes(app);
 
   app.use('/api', (_req, res) => res.status(404).json({ success: false, error: 'not-found' }));
 

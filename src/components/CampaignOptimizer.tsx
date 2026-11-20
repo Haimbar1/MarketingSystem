@@ -6,6 +6,7 @@ import { ArrowRight, Loader2, RefreshCw, CheckCircle2, AlertTriangle, Undo2, Pau
 import WeeklyTrend, { Week } from './WeeklyTrend';
 import AudienceView, { Audience } from './AudienceView';
 import AdMediaPanel from './AdMediaPanel';
+import { BulkAdsPanel, BulkAdsetsPanel } from './BulkEdit';
 
 type M = { spend: number; leads: number; cpl: number | null; ctr?: number | null; frequency?: number; impressions?: number } | null;
 type Suggestion = {
@@ -243,7 +244,12 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
     setNotice({ ok: true, text: `🗑️ נמחק: ${name}` });
     loadChanges();
   };
-  const [mediaFor, setMediaFor] = useState<string | null>(null); // the ad whose "🎬 סרטון" panel is open
+  const [mediaFor, setMediaFor] = useState<string | null>(null);
+  // ticked ads / ad sets for "✏️ שינוי בכמה בבת אחת" (Haim, 2026-11-20)
+  const [selAds, setSelAds] = useState<string[]>([]);
+  const [selSets, setSelSets] = useState<string[]>([]);
+  const [bulk, setBulk] = useState<'ads' | 'adsets' | null>(null);
+  const toggleIn = (list: string[], id: string) => (list.includes(id) ? list.filter(x => x !== id) : [...list, id]); // the ad whose "🎬 סרטון" panel is open
 
   const cur = analysis?.currency || '';
   const rate = analysis?.ilsRate || null;
@@ -453,6 +459,23 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
             {/* ad sets and ads, with manual changes */}
             <div className="space-y-2 text-xs">
               <h4 className="font-bold text-sm text-gray-800">סטים ומודעות - שינוי ידני</h4>
+              {canExecute && (
+                <div className="flex flex-wrap items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-2">
+                  <span className="text-gray-700">סמנו ☑ מודעות או סטים כדי לשנות כמה בבת אחת:</span>
+                  <button className="text-blue-700 underline" onClick={() => setSelAds(selAds.length === analysis.ads.length ? [] : analysis.ads.map(a => a.id))}>{selAds.length === analysis.ads.length ? 'נקה מודעות' : 'כל המודעות'}</button>
+                  <button className="text-blue-700 underline" onClick={() => setSelSets(selSets.length === analysis.adsets.length ? [] : analysis.adsets.map(x => x.id))}>{selSets.length === analysis.adsets.length ? 'נקה סטים' : 'כל הסטים'}</button>
+                  <button disabled={!selAds.length} onClick={() => setBulk('ads')} className="bg-blue-600 text-white font-bold rounded-lg px-2 py-1 disabled:opacity-40">✏️ טקסטים והודעת וואטסאפ ({selAds.length})</button>
+                  <button disabled={!selSets.length} onClick={() => setBulk('adsets')} className="bg-blue-600 text-white font-bold rounded-lg px-2 py-1 disabled:opacity-40">📍 מיקום ומגדר ({selSets.length})</button>
+                </div>
+              )}
+              {bulk === 'ads' && selAds.length > 0 && (
+                <BulkAdsPanel campaignId={String(campaign.id)} ads={analysis.ads.filter(a => selAds.includes(a.id)).map(a => ({ id: a.id, name: a.name }))}
+                  onClose={() => setBulk(null)} onDone={text => { setNotice({ ok: true, text }); loadChanges(); }} />
+              )}
+              {bulk === 'adsets' && selSets.length > 0 && (
+                <BulkAdsetsPanel campaignId={String(campaign.id)} adsets={analysis.adsets.filter(x => selSets.includes(x.id)).map(x => ({ id: x.id, name: x.name }))}
+                  onClose={() => setBulk(null)} onDone={text => { setNotice({ ok: true, text }); loadChanges(); }} />
+              )}
               {analysis.campaign?.dailyBudget != null && canExecute && (
                 <div className="bg-gray-50 rounded-lg p-2">
                   <span className="font-bold text-gray-800">תקציב הקמפיין (CBO): </span>{withIls(analysis.campaign.dailyBudget, cur)} ליום{' '}
@@ -470,7 +493,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                 const paused = (s.configuredStatus || s.status) !== 'ACTIVE';
                 return (
                   <div key={s.id} className="bg-gray-50 rounded-lg p-2 space-y-1">
-                    <div className="font-bold text-gray-800">סט: {s.name} <span className="font-normal text-gray-500">· {statusHe(s.status)}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}{s.ageMin ? ` · גיל ${s.ageMin}–${s.ageMax}` : ''}</span></div>
+                    <div className="font-bold text-gray-800">{canExecute && <input type="checkbox" className="ml-1.5 align-middle" checked={selSets.includes(s.id)} onChange={() => setSelSets(v => toggleIn(v, s.id))} />}סט: {s.name} <span className="font-normal text-gray-500">· {statusHe(s.status)}{s.learning ? ` · למידה: ${s.learning}` : ''}{s.dailyBudget != null ? ` · ${withIls(s.dailyBudget, cur)} ליום` : ''}{s.ageMin ? ` · גיל ${s.ageMin}–${s.ageMax}` : ''}</span></div>
                     <div className="text-gray-600">7 ימים אחרונים: <MetricsCell m={s.m7} cur={cur} rate={rate} /> · 30 ימים אחרונים: <MetricsCell m={s.m30} cur={cur} rate={rate} /></div>
                     {s.crm && <div><CrmLine crm={s.crm} periods={analysis.crmPeriods} /></div>}
                     {canExecute && (
@@ -506,6 +529,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                       const adPaused = (a.configuredStatus || a.status) !== 'ACTIVE';
                       return (
                         <div key={a.id} className="flex flex-wrap items-center gap-2 pr-3">
+                          {canExecute && <input type="checkbox" checked={selAds.includes(a.id)} onChange={() => setSelAds(v => toggleIn(v, a.id))} />}
                           {a.thumb && <img src={a.thumb} alt="" className="w-7 h-7 rounded object-cover" loading="lazy" />}
                           <span className="text-gray-700">{a.name}</span>
                           <span className="text-gray-500">· {statusHe(a.status)} · 7 ימים אחרונים: <MetricsCell m={a.m7} cur={cur} rate={rate} /></span>
