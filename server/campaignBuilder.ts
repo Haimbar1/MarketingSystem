@@ -86,6 +86,12 @@ export function applyTargeting(base: any, d: Draft): any {
   else if (d.genders === 'male') t.genders = [1];
   else if (d.genders === 'all') delete t.genders;
   if (d.advantageAudience != null) t.targeting_automation = { ...(t.targeting_automation || {}), advantage_audience: d.advantageAudience ? 1 : 0 };
+  // `age_range` is Advantage+ audience's suggested age - Meta refuses it without Advantage+ ("The field
+  // targeting_automation must be enabled to use the field age_range", #100/1487079 - Haim, 2026-11-20:
+  // the campaign was created and its ad set refused). With Advantage+ on, the approved age is the suggestion.
+  const advOn = Number(t.targeting_automation?.advantage_audience) === 1;
+  if (!advOn) delete t.age_range;
+  else if (d.ageMin || d.ageMax) t.age_range = [d.ageMin || t.age_range?.[0] || 18, d.ageMax || t.age_range?.[1] || 65];
   return t;
 }
 
@@ -352,19 +358,34 @@ export async function publishDraft(draftId: number): Promise<any> {
         buying_type: base.campaign.buying_type || 'AUCTION',
       };
       if (base.cbo) { campBody.daily_budget = String(budgetMinor); if (base.campaign.bid_strategy) campBody.bid_strategy = base.campaign.bid_strategy; }
+      // an earlier try made the campaign and stopped at the ad set: go on with that campaign (name / budget
+      // updated) instead of opening another empty one - unless it was archived / deleted since
+      let campaignId = '';
+      const earlier = row.published?.campaignId && !row.published?.adsetId ? String(row.published.campaignId) : '';
+      if (earlier) {
+        const ex = await gget(earlier, token, { fields: 'id,effective_status' });
+        if (ex.ok && ex.data?.id && !['ARCHIVED', 'DELETED'].includes(String(ex.data.effective_status))) {
+          const upd: Record<string, any> = { name: draft.name };
+          if (base.cbo) upd.daily_budget = String(budgetMinor);
+          await post(earlier, token, upd);
+          campaignId = earlier;
+        }
+      }
+      if (!campaignId) {
       let camp = await post(`${accountId}/campaigns`, token, campBody);
       if (!camp.ok && /is_adset_budget_sharing_enabled/.test(JSON.stringify(camp.data))) camp = await post(`${accountId}/campaigns`, token, { ...campBody, is_adset_budget_sharing_enabled: false });
       if (!camp.ok || !camp.data?.id) return ({ success: false, error: `יצירת הקמפיין נכשלה: ${metaErr(camp.data)}` });
-      const campaignId = String(camp.data.id);
+      campaignId = String(camp.data.id);
+      }
       steps.push('campaign');
-      await p.query(
+      if (campaignId !== earlier) await p.query(
         `INSERT INTO mk_changes (tenant_id, campaign_id, object_type, object_id, object_name, action, title, before, after, status, done_by)
          VALUES ($1, $2, 'campaign', $2, $3, 'create_campaign', 'קמפיין חדש מהוראה', $4::jsonb, $5::jsonb, 'done', $6)`,
         [currentTenant(), campaignId, draft.name, JSON.stringify({ status: 'ARCHIVED' }), JSON.stringify({ status: 'PAUSED' }), who()],
       );
       const fail = async (error: string) => {
         await p.query(`UPDATE mk_drafts SET published = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify({ campaignId, steps, error })]);
-        return ({ success: false, campaignId, error: `${error} (הקמפיין נוצר מושהה ואפשר לבטל אותו ב"שינויים שבוצעו")` });
+        return ({ success: false, campaignId, error: `${error} (הקמפיין נוצר מושהה ואין בו עדיין סט. אפשר לתקן את הטיוטה וללחוץ שוב "אשר והעלה" - ההעלאה תמשיך באותו קמפיין, בלי לפתוח חדש)` });
       };
 
       // the ad set - a copy of the base's best one with the approved targeting / budget
