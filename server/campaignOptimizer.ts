@@ -673,6 +673,7 @@ export function registerOptimizerRoutes(app: express.Express) {
       const ch = r.rows[0];
       if (!ch) return res.status(404).json({ success: false, error: 'השינוי לא נמצא' });
       if (ch.status !== 'done' || ch.undone_at || ch.undo_of) return res.json({ success: false, error: 'אי אפשר לבטל את השינוי הזה' });
+      if (ch.action === 'delete') return res.json({ success: false, error: 'מחיקה במטא היא סופית - אי אפשר לבטל אותה' });
       const now = await readTarget(creds.token, ch.object_type, ch.object_id);
       if (!now.ok) return res.json({ success: false, error: metaErr(now.data) });
       // a new ad is undone by archiving it whatever its status became (someone may have turned it on)

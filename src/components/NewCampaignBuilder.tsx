@@ -107,6 +107,11 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
     await fetch(`/api/meta-ads/${kind}/${id}`, { method: 'DELETE' }).catch(() => {});
     loadSaved();
   };
+  const deletePublished = async (p: any) => {
+    if (!window.confirm(`למחוק את הקמפיין "${p.name}" במטא, כולל הסטים והמודעות שבו?\n\nהמחיקה סופית - אי אפשר לשחזר.`)) return;
+    const d = await fetch('/api/meta-ads/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'campaign', id: p.campaignId }) }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+    if (d?.success) { setNotice(`🗑️ הקמפיין "${p.name}" נמחק.`); loadSaved(); } else setError(d?.error || 'המחיקה נכשלה');
+  };
   const activateSaved = async (p: any) => {
     if (!window.confirm(`להפעיל עכשיו את הקמפיין "${p.name}"? מרגע זה מטא תתחיל להוציא את התקציב${p.dailyBudgetIls ? ` (₪${p.dailyBudgetIls} ליום)` : ''}.`)) return;
     setBusy('activate'); setError('');
@@ -249,7 +254,10 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
                 {saved.published.map(p => (
                   <div key={`p${p.draftId}`} className="flex flex-wrap items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
                     <span>⏸️ <b>{p.name}</b> · הועלה למטא ומושהה{p.dailyBudgetIls ? ` · ₪${p.dailyBudgetIls} ליום` : ''}</span>
-                    <button onClick={() => activateSaved(p)} disabled={!!busy} className="bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg px-2 py-1 disabled:opacity-50">▶️ להפעיל</button>
+                    <span className="flex gap-1">
+                      <button onClick={() => activateSaved(p)} disabled={!!busy} className="bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg px-2 py-1 disabled:opacity-50">▶️ להפעיל</button>
+                      <button onClick={() => deletePublished(p)} disabled={!!busy} className={btn} title="מחק את הקמפיין במטא">🗑️</button>
+                    </span>
                   </div>
                 ))}
                 {saved.drafts.map(d => (

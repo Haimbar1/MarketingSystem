@@ -229,6 +229,20 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
   const [editVals, setEditVals] = useState<{ min?: string; max?: string; ils?: string }>({});
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const [deletable, setDeletable] = useState<{ campaigns: string[]; ads: string[] }>({ campaigns: [], ads: [] });
+  useEffect(() => { fetch('/api/meta-ads/deletable').then(r => r.json()).then(d => { if (d?.success) setDeletable({ campaigns: d.campaigns || [], ads: d.ads || [] }); }).catch(() => {}); }, []);
+  const ownCampaign = deletable.campaigns.includes(String(campaign.id));
+  // "🗑️" (Haim, 2026-11-20): only what this system created - final in Meta, so asked twice
+  const removeObj = async (type: 'campaign' | 'adset' | 'ad', id: string, name: string) => {
+    const what = type === 'campaign' ? 'את הקמפיין' : type === 'adset' ? 'את סט המודעות' : 'את המודעה';
+    if (!window.confirm(`למחוק ${what} "${name}"?${type === 'campaign' ? ' כולל כל הסטים והמודעות שבו.' : type === 'adset' ? ' כולל המודעות שבו.' : ''}\n\nהמחיקה במטא סופית - אי אפשר לשחזר.`)) return;
+    const d = await fetch('/api/meta-ads/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type, id }) }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+    if (!d?.success) { setNotice({ ok: false, text: `המחיקה נכשלה: ${d?.error || 'שגיאה'}` }); return; }
+    if (type === 'campaign') { onBack(); return; }
+    setAnalysis(a => (a ? { ...a, adsets: type === 'adset' ? a.adsets.filter(x => x.id !== id) : a.adsets, ads: a.ads.filter(x => (type === 'adset' ? x.adsetId !== id : x.id !== id)) } : a));
+    setNotice({ ok: true, text: `🗑️ נמחק: ${name}` });
+    loadChanges();
+  };
   const [mediaFor, setMediaFor] = useState<string | null>(null); // the ad whose "🎬 סרטון" panel is open
 
   const cur = analysis?.currency || '';
@@ -338,7 +352,10 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
 
       <div className="bg-white rounded-xl border border-gray-200 p-4 space-y-4">
         <div>
-          <h3 className="font-bold text-gray-800">🔧 {campaign.name}</h3>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-bold text-gray-800">🔧 {campaign.name}</h3>
+            {ownCampaign && <button onClick={() => removeObj('campaign', String(campaign.id), campaign.name)} className="text-xs text-red-700 border border-red-200 bg-red-50 rounded-lg px-2 py-1 hover:bg-red-100">🗑️ מחק קמפיין</button>}
+          </div>
           <p className="text-xs text-gray-500">ניתוח והצעות לשיפור · שום דבר לא משתנה במטא בלי האישור שלך</p>
         </div>
         {loading && <p className="text-sm text-gray-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> קורא את הקמפיין מ-Meta ומנתח… (עד דקה)</p>}
@@ -467,6 +484,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                         {s.dailyBudget != null && (
                           <button className={btn} disabled={busy} onClick={() => { setEdit({ kind: 'budget', id: s.id }); setEditVals({ ils: String(curToIls(s.dailyBudget) ?? '') }); }}><Pencil className="w-3 h-3" /> תקציב יומי</button>
                         )}
+                        {ownCampaign && <button className={`${btn} text-red-700`} disabled={busy} onClick={() => removeObj('adset', s.id, s.name)}>🗑️ מחק סט</button>}
                       </div>
                     )}
                     {edit?.kind === 'age' && edit.id === s.id && (
@@ -500,6 +518,9 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                           {canExecute && (
                             <button className={btn} disabled={busy} onClick={() => setMediaFor(mediaFor === a.id ? null : a.id)}>🖼️ מדיה</button>
                           )}
+                          {(ownCampaign || deletable.ads.includes(a.id)) && (
+                            <button className={`${btn} text-red-700`} disabled={busy} onClick={() => removeObj('ad', a.id, a.name)}>🗑️ מחק</button>
+                          )}
                           {mediaFor === a.id && (
                             <div className="basis-full">
                               <AdMediaPanel ad={{ id: a.id, name: a.name }} rate={rate} currency={cur} onClose={() => setMediaFor(null)}
@@ -529,7 +550,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                     {c.undone_at && <span className="text-gray-500"> · בוטל</span>}
                   </div>
                 </div>
-                {c.status === 'done' && !c.undone_at && !c.undo_of && (
+                {c.status === 'done' && !c.undone_at && !c.undo_of && c.action !== 'delete' && (
                   <button onClick={() => undo(c)} disabled={undoing === c.id} className="shrink-0 flex items-center gap-1 text-gray-700 border border-gray-300 rounded-lg px-2 py-1 hover:bg-white disabled:opacity-50">
                     <Undo2 className="w-3.5 h-3.5" /> בטל
                   </button>

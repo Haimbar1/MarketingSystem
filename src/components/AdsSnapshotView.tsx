@@ -187,6 +187,14 @@ export default function AdsSnapshotView() {
   const [optimizeFor, setOptimizeFor] = useState<{ id: string; name: string } | null>(null);
   const [building, setBuilding] = useState(false);
   const [approversOpen, setApproversOpen] = useState(false);
+  const [ownCampaigns, setOwnCampaigns] = useState<string[]>([]);
+  useEffect(() => { fetch('/api/meta-ads/deletable').then(r => r.json()).then(d => { if (d?.success) setOwnCampaigns(d.campaigns || []); }).catch(() => {}); }, [snap]);
+  // "🗑️" only on campaigns this system created (Haim, 2026-11-20) - final in Meta
+  const deleteCampaign = async (c: any) => {
+    if (!window.confirm(`למחוק את הקמפיין "${c.name}" כולל כל הסטים והמודעות שבו?\n\nהמחיקה במטא סופית - אי אפשר לשחזר.`)) return;
+    const d = await fetch('/api/meta-ads/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'campaign', id: String(c.id) }) }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+    if (d?.success) load(); else window.alert(`המחיקה נכשלה: ${d?.error || 'שגיאה'}`);
+  };
 
   const load = async () => {
     setLoading(true); setError('');
@@ -310,6 +318,9 @@ export default function AdsSnapshotView() {
                         className="text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg px-3 py-1.5">
                         🔧 ניתוח והצעות לשיפור
                       </button>
+                      {ownCampaigns.includes(String(c.id)) && (
+                        <button onClick={() => deleteCampaign(c)} className="mr-1 text-xs text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg px-3 py-1.5">🗑️ מחק</button>
+                      )}
                     </div>
                     {isOpen && (
                       <div className="px-3 pb-3 space-y-2">
