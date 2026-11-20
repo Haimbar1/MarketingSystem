@@ -6,6 +6,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Loader2, RefreshCw, Download, ChevronDown, ChevronLeft } from 'lucide-react';
 import CampaignOptimizer from './CampaignOptimizer';
 import NewCampaignBuilder from './NewCampaignBuilder';
+import WaApprovers from './WaApprovers';
 
 type Part = { ok: boolean; data: any[]; error?: string; droppedFields?: string[] };
 type Snapshot = {
@@ -185,6 +186,7 @@ export default function AdsSnapshotView() {
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [optimizeFor, setOptimizeFor] = useState<{ id: string; name: string } | null>(null);
   const [building, setBuilding] = useState(false);
+  const [approversOpen, setApproversOpen] = useState(false);
 
   const load = async () => {
     setLoading(true); setError('');
@@ -237,7 +239,7 @@ export default function AdsSnapshotView() {
   return (
     <div dir="rtl">
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 w-full flex flex-col">
-        <div className="flex items-start justify-between gap-2 p-4 border-b border-gray-100">
+        <div className="flex flex-wrap items-start justify-between gap-2 p-4 border-b border-gray-100">
           <div className="min-w-0">
             <h3 className="font-bold text-gray-800">📣 ממומן — צילום מצב של חשבון המודעות</h3>
             <p className="text-xs text-gray-500">
@@ -245,7 +247,8 @@ export default function AdsSnapshotView() {
               {snap && <> · {snap.account?.data?.name || snap.accountId} · נקרא {new Date(snap.takenAt).toLocaleString('he-IL')}</>}
             </p>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="flex flex-wrap items-center justify-end gap-1">
+            <button onClick={() => setApproversOpen(o => !o)} className="bg-green-600 hover:bg-green-700 text-white text-xs font-bold rounded-lg px-3 py-2 whitespace-nowrap">📲 מורשים בוואטסאפ</button>
             <button onClick={() => setBuilding(true)} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg px-3 py-2 whitespace-nowrap">✨ קמפיין חדש מהוראה</button>
             <button onClick={load} disabled={loading} title="קרא שוב" className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 disabled:opacity-50">
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
@@ -270,6 +273,7 @@ export default function AdsSnapshotView() {
         )}
 
         <div className="p-4 space-y-3">
+          {approversOpen && <WaApprovers onClose={() => setApproversOpen(false)} />}
           {loading && !snap && <p className="text-sm text-gray-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> קורא את כל הקמפיינים מחשבון המודעות…</p>}
           {error && <p className="text-sm text-red-700 bg-red-50 rounded-lg p-3">{error}</p>}
 
