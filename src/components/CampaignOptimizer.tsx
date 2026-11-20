@@ -498,7 +498,7 @@ export default function CampaignOptimizer({ campaign, onBack }: { campaign: { id
                             </button>
                           )}
                           {canExecute && (
-                            <button className={btn} disabled={busy} onClick={() => setMediaFor(mediaFor === a.id ? null : a.id)}>🎬 סרטון</button>
+                            <button className={btn} disabled={busy} onClick={() => setMediaFor(mediaFor === a.id ? null : a.id)}>🖼️ מדיה</button>
                           )}
                           {mediaFor === a.id && (
                             <div className="basis-full">
