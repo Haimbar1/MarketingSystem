@@ -120,7 +120,7 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
   const deletePublished = async (p: any) => {
     if (!window.confirm(`למחוק את הקמפיין "${p.name}" במטא, כולל הסטים והמודעות שבו?\n\nהמחיקה סופית - אי אפשר לשחזר.`)) return;
     const d = await fetch('/api/meta-ads/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'campaign', id: p.campaignId }) }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
-    if (d?.success) { setNotice(`🗑️ הקמפיין "${p.name}" נמחק.`); loadSaved(); } else setError(d?.error || 'המחיקה נכשלה');
+    if (d?.success) { setNotice(`🗑️ הקמפיין "${p.name}" נמחק.`); setSaved(sv => (sv ? { ...sv, published: sv.published.filter((x: any) => x.campaignId !== p.campaignId) } : sv)); loadSaved(); } else setError(d?.error || 'המחיקה נכשלה');
   };
   const activateSaved = async (p: any) => {
     if (!window.confirm(`להפעיל עכשיו את הקמפיין "${p.name}"? מרגע זה מטא תתחיל להוציא את התקציב${p.dailyBudgetIls ? ` (₪${p.dailyBudgetIls} ליום)` : ''}.`)) return;

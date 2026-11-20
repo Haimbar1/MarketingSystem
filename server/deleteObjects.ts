@@ -59,6 +59,10 @@ export function registerDeleteRoutes(app: express.Express) {
          VALUES ($1, $2, $3, $4, $5, 'delete', $6, $7::jsonb, $8::jsonb, $9, $10, $11)`,
         [currentTenant(), campaignId, type, id, now.data?.name || null, `מחיקת ${NAMES[type]}`, JSON.stringify({ status: now.data?.status }), JSON.stringify({ status: 'DELETED' }), ok ? 'done' : 'failed', ok ? null : metaErr(w.data), who()],
       );
+      // the draft it came from leaves "📂 שמורות" at once (Meta may still report the old status for a while)
+      if (ok && type === 'campaign') {
+        await p.query(`UPDATE mk_drafts SET status = 'deleted' WHERE tenant_id = $1 AND published->>'campaignId' = $2`, [currentTenant(), id]).catch(() => {});
+      }
       res.json({ success: ok, error: ok ? undefined : metaErr(w.data), name: now.data?.name });
     } catch (e: any) {
       res.json({ success: false, error: e?.message || 'שגיאה' });

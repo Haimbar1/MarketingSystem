@@ -483,12 +483,18 @@ export function registerChatRoutes(app: express.Express) {
         const statuses: Record<string, string> = {};
         const creds = ids.length ? await adsCredsForCurrentBusiness() : null;
         if (creds) {
+          // one read per campaign: a campaign gone from Meta fails a combined ?ids= read for all of them
           const GRAPH = process.env.META_GRAPH_URL || 'https://graph.facebook.com/v21.0';
-          try {
-            const r = await fetch(`${GRAPH}/?ids=${ids.join(',')}&fields=effective_status&access_token=${encodeURIComponent(creds.token)}`, { signal: AbortSignal.timeout(10000) });
-            const d: any = await r.json().catch(() => ({}));
-            for (const id of ids) if (d?.[id]?.effective_status) statuses[id] = d[id].effective_status;
-          } catch { /* shown without a status */ }
+          await Promise.all(ids.map(async id => {
+            try {
+              const r = await fetch(`${GRAPH}/${id}?fields=effective_status&access_token=${encodeURIComponent(creds.token)}`, { signal: AbortSignal.timeout(10000) });
+              const d: any = await r.json().catch(() => ({}));
+              if (d?.effective_status) statuses[id] = d.effective_status;
+              else if (d?.error && (d.error.code === 100 || /does not exist|Unsupported get request/i.test(String(d.error.message || '')))) statuses[id] = 'DELETED';
+            } catch { /* shown without a status */ }
+          }));
+          const gone = ids.filter(id => ['DELETED', 'ARCHIVED'].includes(statuses[id]));
+          if (gone.length) await p.query(`UPDATE mk_drafts SET status = 'deleted' WHERE tenant_id = $1 AND status = 'published' AND published->>'campaignId' = ANY($2::text[])`, [t, gone]).catch(() => {});
         }
         published = pub
           .map((r: any) => ({ draftId: Number(r.id), name: r.draft?.name, dailyBudgetIls: r.draft?.dailyBudgetIls, campaignId: String(r.published?.campaignId || ''), publishedAt: r.published_at, status: statuses[String(r.published?.campaignId || '')] || '' }))
