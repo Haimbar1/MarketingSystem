@@ -47,6 +47,50 @@ export function kindOf(adset: any, ads: any[] = []): Kind {
 // A copied creative led to WhatsApp instead of a form / site: "שלח הודעה בוואטסאפ" (click-to-WhatsApp)
 const WA_LINK = 'https://api.whatsapp.com/send';
 const waCta = () => ({ type: 'WHATSAPP_MESSAGE', value: { app_destination: 'WHATSAPP', link: WA_LINK } });
+// What the customer sees when the ad opens WhatsApp (Haim, 2026-11-20 - Meta's default "Hello! Can I get more
+// info on this?"; "I want them to try to book an eye exam", editable): the pre-filled message the customer
+// sends (נועם answers it), the business's welcome line and up to 3 quick buttons. Meta's `page_welcome_message`
+// (the Ads Manager "Conversations" box) - in link_data / video_data, or a flexible ad's `additional_data`.
+export const WA_DEFAULTS = {
+  prefill: 'היי, אשמח לקבוע תור 🙂',
+  welcome: 'שלום! 👋 נשמח לקבוע לך תור. לחצו שלח ונמצא מועד שנוח לך',
+  quick: ['📅 לקבוע תור', '💰 כמה זה עולה?'],
+};
+export function welcomeMessageJson(d: { waPrefill?: string | null; waWelcome?: string | null; waQuickReplies?: string[] }): string {
+  const prefill = String(d.waPrefill || '').trim();
+  const quick = (d.waQuickReplies || []).map(q => String(q).trim()).filter(Boolean).slice(0, 3);
+  return JSON.stringify({
+    type: 'VISUAL_EDITOR', version: 2, landing_screen_type: 'welcome_message', media_type: 'text',
+    text_format: {
+      customer_action_type: prefill ? 'autofill_message' : 'ice_breakers',
+      message: {
+        text: String(d.waWelcome || '').trim() || WA_DEFAULTS.welcome,
+        ...(prefill ? { autofill_message: { content: prefill } } : {}),
+        ice_breakers: quick.map(title => ({ title, response: '' })),
+        quick_replies: [],
+      },
+    },
+    user_edit: false, surface: 'visual_editor_new',
+  });
+}
+export function withWelcomeMessage(spec: any, json: string): any {
+  const oss = spec.object_story_spec;
+  if (oss?.video_data) oss.video_data.page_welcome_message = json;
+  else if (oss?.link_data) oss.link_data.page_welcome_message = json;
+  else if (spec.asset_feed_spec) spec.asset_feed_spec.additional_data = { ...(spec.asset_feed_spec.additional_data || {}), page_welcome_message: json };
+  return spec;
+}
+const withoutWelcome = (body: Record<string, any>) => {
+  const out: Record<string, any> = { ...body };
+  for (const k of ['object_story_spec', 'asset_feed_spec']) {
+    if (!out[k]) continue;
+    const v = typeof out[k] === 'string' ? JSON.parse(out[k]) : JSON.parse(JSON.stringify(out[k]));
+    delete v.video_data?.page_welcome_message; delete v.link_data?.page_welcome_message; delete v.additional_data?.page_welcome_message;
+    out[k] = typeof out[k] === 'string' ? JSON.stringify(v) : v;
+  }
+  return out;
+};
+
 export function toWhatsAppSpec(spec: any): any {
   const oss = spec.object_story_spec;
   if (oss?.video_data) oss.video_data.call_to_action = waCta();
@@ -191,6 +235,9 @@ export type Draft = {
   texts: { bodies: string[]; titles: string[]; descriptions: string[] };
   media: { type: 'video' | 'image'; id?: string; hash?: string; thumb?: string }[]; // empty = the base ads' media
   kind?: 'whatsapp' | 'lead_form' | null; // null = as the base (where the ad leads)
+  waPrefill?: string | null; // WhatsApp campaigns: the message the customer sends
+  waWelcome?: string | null; // … the business's welcome line
+  waQuickReplies?: string[]; // … quick buttons (≤3)
   explanation?: string;
 };
 
@@ -211,9 +258,18 @@ export function cleanDraft(raw: any, ctx: any): Draft {
     media: (Array.isArray(raw?.media) ? raw.media : []).filter((m: any) => (m?.type === 'video' && m.id) || (m?.type === 'image' && m.hash)).slice(0, 10)
       .map((m: any) => ({ type: m.type, id: m.id ? String(m.id).replace(/\D/g, '') : undefined, hash: m.hash ? String(m.hash).replace(/[^\w]/g, '') : undefined, thumb: m.thumb ? String(m.thumb) : undefined })),
     kind: ['whatsapp', 'lead_form'].includes(raw?.kind) && raw.kind !== ctx?.kind ? raw.kind : null,
+    waPrefill: raw?.waPrefill != null ? String(raw.waPrefill).slice(0, 300) : null,
+    waWelcome: raw?.waWelcome != null ? String(raw.waWelcome).slice(0, 600) : null,
+    waQuickReplies: list(raw?.waQuickReplies, 3).map(s => s.slice(0, 80)),
     explanation: raw?.explanation ? String(raw.explanation).slice(0, 1500) : undefined,
   };
   if (d.ageMin && d.ageMax && d.ageMin > d.ageMax) [d.ageMin, d.ageMax] = [d.ageMax, d.ageMin];
+  // a campaign that leads to WhatsApp always has its conversation box filled (Meta's default is "Can I get more info?")
+  if (d.kind === 'whatsapp' || (!d.kind && ctx?.kind === 'whatsapp')) {
+    if (d.waPrefill == null) d.waPrefill = WA_DEFAULTS.prefill;
+    if (d.waWelcome == null) d.waWelcome = WA_DEFAULTS.welcome;
+    if (!d.waQuickReplies?.length && raw?.waQuickReplies == null) d.waQuickReplies = [...WA_DEFAULTS.quick];
+  }
   return d;
 }
 
@@ -240,8 +296,9 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta לעסק ק�
 - name: שם קצר לקמפיין בעברית (מה, איפה, תאריך).
 - explanation: 2-4 משפטים: מה לקחת מהבסיס ומה שינית ולמה.
 אם יש agreed - זה מה שסוכם עם בעל העסק בשיחה לפני הבנייה (מיקום, תקציב, גיל, מסר...): לבנות בדיוק לפיו ולא לשנות דבר שסוכם.
+- waPrefill / waWelcome / waQuickReplies - רק כשהקמפיין מוביל לוואטסאפ (kind = "whatsapp" או base.kind = "whatsapp"), אחרת null: waPrefill = ההודעה שהלקוח שולח בלחיצה (גוף ראשון, קצרה, מכוונת לקבוע תור / בדיקה לפי ההצעה, למשל "היי, אשמח לקבוע בדיקת ראייה 👓"); waWelcome = משפט פתיחה של העסק שמזמין לקבוע; waQuickReplies = 2-3 כפתורים קצרים, הראשון לקביעת תור.
 - kind: "whatsapp" אם ההוראה (או agreed.kind) מבקשת שהמודעה תוביל לשיחה בוואטסאפ ו-base.kind אחר; אחרת null (כמו בבסיס).
-החזר JSON בלבד: { "name", "kind", "dailyBudgetIls", "places", "ageMin", "ageMax", "genders", "texts": { "bodies": [], "titles": [], "descriptions": [] }, "explanation" }`;
+החזר JSON בלבד: { "name", "kind", "waPrefill", "waWelcome", "waQuickReplies", "dailyBudgetIls", "places", "ageMin", "ageMax", "genders", "texts": { "bodies": [], "titles": [], "descriptions": [] }, "explanation" }`;
 
 // ---------- reading the base ----------
 
@@ -499,11 +556,11 @@ export async function publishDraft(draftId: number): Promise<any> {
       // the ads - each base ad with the approved texts (and the new media)
       const media = await draftMedia(draft, token);
       if (typeof media === 'string') return fail(media);
-      const { created, errors } = await buildAds(draft, base, media, token, accountId, adsetId, undefined, toKind === 'whatsapp');
-      if (noRules) errors.push('כללי הערך למיקום לא התאימו לקמפיין וואטסאפ - הסט נוצר בלעדיהם');
+      const { created, errors, notes } = await buildAds(draft, base, media, token, accountId, adsetId, undefined, toKind === 'whatsapp');
+      if (noRules) notes.push('כללי הערך למיקום לא התאימו לקמפיין וואטסאפ - הסט נוצר בלעדיהם');
       if (!created.length) return fail(`לא נוצרה אף מודעה: ${errors.join(' · ') || 'אין מודעות בסט הבסיס'}`);
       steps.push('ads');
-      const published = { campaignId, adsetId, ads: created, errors, at: new Date().toISOString() };
+      const published = { campaignId, adsetId, ads: created, errors, notes, at: new Date().toISOString() };
       await p.query(`UPDATE mk_drafts SET status = 'published', published = $2::jsonb, published_at = now() WHERE id = $1`, [row.id, JSON.stringify(published)]);
       return ({ success: true, ...published, name: draft.name });
     } catch (e: any) {
@@ -523,6 +580,9 @@ async function baseInstagram(base: Base, token: string): Promise<string> {
 
 async function buildAds(draft: Draft, base: Base, media: Media[], token: string, accountId: string, adsetId: string, only?: (ad: any) => boolean, whatsapp = false) {
   const ig = await baseInstagram(base, token);
+  const isWa = whatsapp || kindOf(base.best, base.baseAds) === 'whatsapp';
+  const welcome = isWa ? welcomeMessageJson(draft) : '';
+  let welcomeDropped = false;
   const created: { id: string; name: string }[] = [];
   const errors: string[] = [];
   const sources = (base.baseAds.length ? base.baseAds : []).filter((a: any) => !only || only(a));
@@ -563,16 +623,24 @@ async function buildAds(draft: Draft, base: Base, media: Media[], token: string,
     if (spec.degrees_of_freedom_spec !== undefined) spec.degrees_of_freedom_spec = cleanDof(spec.degrees_of_freedom_spec);
     spec = withInstagram(spec, ig);
     if (whatsapp) spec = toWhatsAppSpec(spec);
+    if (welcome) spec = withWelcomeMessage(spec, welcome);
     if (!spec.object_story_spec && !spec.asset_feed_spec) { errors.push(`${ad.name}: המודעה מבוססת על פוסט קיים - דילגנו`); continue; }
     const crBody: Record<string, any> = { name: `${draft.name} - ${ad.name}`.slice(0, 200) };
     for (const [k, v] of Object.entries(spec)) if (v != null) crBody[k] = v;
-    const cr = await postCreative(post, `${accountId}/adcreatives`, token, crBody);
+    let cr = await postCreative(post, `${accountId}/adcreatives`, token, crBody);
+    if (!cr.ok && welcome) {
+      // the conversation box is the least documented part - the ad goes without it rather than not at all
+      const again = await postCreative(post, `${accountId}/adcreatives`, token, withoutWelcome(crBody));
+      if (again.ok) { cr = again; welcomeDropped = true; }
+    }
     if (!cr.ok || !cr.data?.id) { errors.push(`${ad.name}: ${metaErr(cr.data)}`); continue; }
     const na = await post(`${accountId}/ads`, token, { name: `${ad.name}`.slice(0, 200), adset_id: adsetId, creative: { creative_id: String(cr.data.id) }, status: 'ACTIVE' });
     if (!na.ok || !na.data?.id) { errors.push(`${ad.name}: ${metaErr(na.data)}`); continue; }
     created.push({ id: String(na.data.id), name: ad.name });
   }
-  return { created, errors };
+  const notes: string[] = [];
+  if (welcomeDropped) notes.push('הודעת הפתיחה בוואטסאפ לא התקבלה אצל מטא - המודעות נוצרו בלעדיה. אפשר להגדיר אותה במנהל המודעות: מודעה ← Conversations ← Edit');
+  return { created, errors, notes };
 }
 
 async function draftMedia(draft: Draft, token: string): Promise<Media[] | string> {
@@ -604,8 +672,8 @@ export async function retryFailedAds(draftId: number): Promise<any> {
   if (typeof media === 'string') return { success: false, error: media };
   const done = new Set((row.published.ads || []).map((a: any) => String(a.name)));
   const toWa = draft.kind === 'whatsapp' && kindOf(base.best, base.baseAds) !== 'whatsapp';
-  const { created, errors } = await buildAds(draft, base, media, creds.token, creds.accountId, String(row.published.adsetId), (a: any) => !done.has(String(a.name)), toWa);
-  const published = { ...row.published, ads: [...(row.published.ads || []), ...created], errors };
+  const { created, errors, notes } = await buildAds(draft, base, media, creds.token, creds.accountId, String(row.published.adsetId), (a: any) => !done.has(String(a.name)), toWa);
+  const published = { ...row.published, ads: [...(row.published.ads || []), ...created], errors, notes: [...(row.published.notes || []), ...notes] };
   await p.query(`UPDATE mk_drafts SET published = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify(published)]);
   return { success: created.length > 0 || !errors.length, ...published, name: draft.name, added: created.length, error: !created.length && errors.length ? errors.join(' · ') : undefined };
 }

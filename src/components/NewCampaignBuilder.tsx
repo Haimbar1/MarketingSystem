@@ -15,6 +15,7 @@ type Draft = {
   texts: { bodies: string[]; titles: string[]; descriptions: string[] };
   media: { type: 'video' | 'image'; id?: string; hash?: string; thumb?: string; name?: string }[];
   kind?: 'whatsapp' | 'lead_form' | null;
+  waPrefill?: string | null; waWelcome?: string | null; waQuickReplies?: string[];
   explanation?: string;
 };
 type Ctx = {
@@ -158,7 +159,11 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
     setDraft(next);
     if (!draftId) return;
     const d = await fetch(`/api/meta-ads/drafts/${draftId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ draft: next }) }).then(r => r.json()).catch(() => null);
-    if (d?.success) setProblems(d.problems || []);
+    if (d?.success) {
+      setProblems(d.problems || []);
+      // the server fills the WhatsApp conversation box when the kind turns to WhatsApp
+      if (d.draft && (d.draft.kind !== draft?.kind || (d.draft.waPrefill != null && next.waPrefill == null))) setDraft(d.draft);
+    }
   };
   const patch = (p: Partial<Draft>) => draft && save({ ...draft, ...p });
   const setText = (kind: 'bodies' | 'titles' | 'descriptions', i: number, v: string) => {
@@ -305,6 +310,25 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
               </select>
               {draft.kind === 'whatsapp' && ctx.kind !== 'whatsapp' && <span className="text-amber-700">המודעות יובילו לשיחה בוואטסאפ במקום ל{KIND_HE[ctx.kind || ''] || 'מה שבבסיס'}. זה הקמפיין הראשון שנבנה כך - נבדוק אותו בהעלאה.</span>}
             </div>
+            {(draft.kind === 'whatsapp' || (!draft.kind && ctx.kind === 'whatsapp')) && (
+              <div className="space-y-1.5 text-xs bg-green-50 border border-green-200 rounded-lg p-2">
+                <div className="font-bold text-gray-700">💬 מה הלקוח רואה כשהוא לוחץ על המודעה</div>
+                <label className="block space-y-0.5"><span className="text-gray-600">ההודעה שכבר כתובה לו בוואטסאפ - הוא רק לוחץ "שלח", ונועם עונה ומציע תור:</span>
+                  <input value={draft.waPrefill || ''} onChange={e => setDraft({ ...draft, waPrefill: e.target.value })} onBlur={() => save(draft)} className={`${input} w-full`} placeholder="היי, אשמח לקבוע בדיקת ראייה 👓" /></label>
+                <label className="block space-y-0.5"><span className="text-gray-600">הודעת הפתיחה של העסק:</span>
+                  <textarea value={draft.waWelcome || ''} rows={2} onChange={e => setDraft({ ...draft, waWelcome: e.target.value })} onBlur={() => save(draft)} className="w-full border border-gray-300 rounded p-1.5" placeholder="שלום! 👓 נשמח לקבוע לך בדיקת ראייה…" /></label>
+                <div className="space-y-0.5">
+                  <span className="text-gray-600">כפתורים מוכנים (עד 3):</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[0, 1, 2].map(i => (
+                      <input key={i} value={draft.waQuickReplies?.[i] || ''} placeholder={i === 0 ? '📅 לקבוע תור' : i === 1 ? '💰 כמה זה עולה?' : '(לא חובה)'}
+                        onChange={e => { const q = [...(draft.waQuickReplies || [])]; q[i] = e.target.value; setDraft({ ...draft, waQuickReplies: q }); }}
+                        onBlur={() => save({ ...draft, waQuickReplies: (draft.waQuickReplies || []).filter(x => x && x.trim()) })} className={`${input} w-40`} />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
             <div className="grid sm:grid-cols-2 gap-2 text-xs">
               <label className="space-y-0.5"><span className="text-gray-600">שם הקמפיין</span>
                 <input value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} onBlur={() => save(draft)} className={`${input} w-full`} /></label>
@@ -424,6 +448,7 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
             <p className="text-green-800 bg-green-50 rounded-lg p-3 text-sm">
               ✓ הקמפיין "{result.name}" נוצר במטא {activated ? 'ופועל עכשיו' : 'מושהה'}, עם סט אחד ו-{result.ads.length} מודעות.
             </p>
+            {result.notes?.length ? <ul className="text-xs text-blue-900 bg-blue-50 rounded-lg p-2 list-disc pr-5">{result.notes.map((n: string, i: number) => <li key={i}>{n}</li>)}</ul> : null}
             {result.errors?.length ? (
               <div className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2 space-y-1.5">
                 <p>חלק מהמודעות לא נוצרו: {result.errors.join(' · ')}</p>

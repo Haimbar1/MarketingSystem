@@ -176,6 +176,8 @@ export function draftSummary(id: number, d: Draft, ctx: any, problems: string[])
     '',
     `*טקסט ראשי:* ${d.texts.bodies[0] || '—'}`,
     d.texts.titles.length ? `*כותרות:* ${d.texts.titles.join(' · ')}` : '',
+    d.waPrefill ? `*בוואטסאפ הלקוח שולח:* ${d.waPrefill}` : '',
+    d.waWelcome ? `*הודעת פתיחה:* ${d.waWelcome}` : '',
   ].filter(l => l !== '');
   if (problems.length) {
     lines.push('', '⚠️ *צריך לתקן לפני העלאה:*', ...problems.map(p => `• ${p}`), '', 'כתבו לי מה לשנות.');
@@ -295,7 +297,7 @@ export async function buildFromBrief(briefId: number): Promise<any> {
 
 const EDIT_SYSTEM = `בעל העסק ענה על סיכום טיוטת קמפיין או על שאלת "להפעיל?". סווג את ההודעה.
 intent: "confirm" (מאשר את מה שנשאל), "decline" (לא עכשיו / לא לאשר), "edit" (רוצה לשנות משהו בטיוטה), "new" (רוצה קמפיין אחר / חדש), "other" (לא קשור לקמפיין).
-edits (רק ב-edit, רק מה שנאמר): { "kind" ("whatsapp" | "lead_form"), "dailyBudgetIls", "ageMin", "ageMax", "genders" ("all"|"female"|"male"), "advantageAudience" (true/false), "addPlaces": [{ "name", "radiusKm" }], "removePlaces": [שמות], "name", "bodies": [טקסטים חדשים], "titles": [כותרות חדשות] }.
+edits (רק ב-edit, רק מה שנאמר): { "kind" ("whatsapp" | "lead_form"), "waPrefill" (מה הלקוח שולח בוואטסאפ), "waWelcome" (הודעת הפתיחה), "waQuickReplies": [כפתורים], "dailyBudgetIls", "ageMin", "ageMax", "genders" ("all"|"female"|"male"), "advantageAudience" (true/false), "addPlaces": [{ "name", "radiusKm" }], "removePlaces": [שמות], "name", "bodies": [טקסטים חדשים], "titles": [כותרות חדשות] }.
 החזר JSON בלבד: { "intent", "edits" }`;
 
 async function classifyAnswer(text: string, prompt: any, draft: Draft | null): Promise<{ intent: string; edits?: any }> {
@@ -313,7 +315,7 @@ async function applyEdits(draftId: number, edits: any): Promise<{ ok: boolean; m
   if (!row || row.status !== 'draft') return { ok: false, msg: { text: 'הטיוטה הזו כבר הועלתה - אי אפשר לשנות אותה מכאן.' }, unmatched: [] };
   const d: any = JSON.parse(JSON.stringify(row.draft));
   const e = edits || {};
-  for (const k of ['dailyBudgetIls', 'ageMin', 'ageMax', 'genders', 'advantageAudience', 'name', 'kind']) if (e[k] != null && e[k] !== '') d[k] = e[k];
+  for (const k of ['dailyBudgetIls', 'ageMin', 'ageMax', 'genders', 'advantageAudience', 'name', 'kind', 'waPrefill', 'waWelcome', 'waQuickReplies']) if (e[k] != null && e[k] !== '') d[k] = e[k];
   if (Array.isArray(e.bodies) && e.bodies.length) d.texts.bodies = e.bodies;
   if (Array.isArray(e.titles) && e.titles.length) d.texts.titles = e.titles;
   const unmatched: string[] = [];
@@ -386,7 +388,7 @@ async function ownerMessage(input: { phone: string; text: string; buttonId?: str
       const out = await publishDraft(id);
       if (!out?.success) { await send([{ text: `ההעלאה נכשלה: ${out?.error || 'שגיאה'}` }], null); return; }
       await send([{
-        text: `✓ הקמפיין *"${out.name}"* נוצר במטא *מושהה*, עם ${out.ads.length} מודעות${out.errors?.length ? ` (חלק לא נוצרו: ${out.errors.join(' · ')})` : ''}.\n\nלהפעיל אותו עכשיו? מרגע ההפעלה מטא מתחילה להוציא *₪${row.draft?.dailyBudgetIls} ליום*.`,
+        text: `✓ הקמפיין *"${out.name}"* נוצר במטא *מושהה*, עם ${out.ads.length} מודעות${out.errors?.length ? ` (חלק לא נוצרו: ${out.errors.join(' · ')})` : ''}${out.notes?.length ? `\n\n${out.notes.map((n: string) => `ℹ️ ${n}`).join('\n')}` : ''}.\n\nלהפעיל אותו עכשיו? מרגע ההפעלה מטא מתחילה להוציא *₪${row.draft?.dailyBudgetIls} ליום*.`,
         buttons: [{ id: `mk_act_${id}`, title: '▶️ להפעיל' }, { id: `mk_later_${id}`, title: '⏸️ להשאיר מושהה' }],
       }], { kind: 'act', draftId: id, campaignId: out.campaignId });
       return;
