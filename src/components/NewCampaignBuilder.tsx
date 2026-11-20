@@ -1,8 +1,10 @@
-// "✨ קמפיין חדש מהוראה" (Haim, 2026-11-20 - step 3): write what you want, pick the base campaign (the
-// one with the most leads in 30 days by default) → the AI's draft (name, budget, places, age, gender,
-// texts) → review / edit, optionally new pictures / videos → "אשר והעלה" creates it in Meta PAUSED →
-// "▶️ להפעיל את הקמפיין" when ready. Server: server/campaignBuilder.ts. In the page, not a pop-up.
-import React, { useEffect, useState } from 'react';
+// "✨ קמפיין חדש מהוראה" (Haim, 2026-11-20 - step 3): a conversation first - write what you want, נועם
+// answers what he understood and asks about what's unclear, until "✅ בנה טיוטה" (Haim: "first show what
+// you understood until the client approves - every build takes time"; server/campaignChat.ts) → the
+// draft (name, budget, places, age, gender, texts) → review / edit, optionally new pictures / videos, or
+// send it to the approvers on WhatsApp → "אשר והעלה" creates it in Meta PAUSED → "▶️ להפעיל את הקמפיין".
+// Server: server/campaignBuilder.ts. In the page, not a pop-up.
+import React, { useEffect, useRef, useState } from 'react';
 import { ArrowRight, Loader2, X, Plus } from 'lucide-react';
 import { uploadMedia, UploadedMedia } from '../utils/mediaUpload';
 
@@ -28,7 +30,15 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
   const [bases, setBases] = useState<Base[] | null>(null);
   const [baseId, setBaseId] = useState('');
   const [instruction, setInstruction] = useState('');
-  const [busy, setBusy] = useState<'' | 'draft' | 'save' | 'publish' | 'upload' | 'activate'>('');
+  const [briefId, setBriefId] = useState<number | null>(null);
+  const [chat, setChat] = useState<{ role: 'owner' | 'bot'; text: string }[]>([]);
+  const [ready, setReady] = useState(false);
+  const chatBox = useRef<HTMLDivElement>(null);
+  const [approvers, setApprovers] = useState<{ name: string; phone: string }[]>([]);
+  const [newApprover, setNewApprover] = useState({ name: '', phone: '' });
+  const [waResult, setWaResult] = useState('');
+  const [busy, setBusy] = useState<'' | 'talk' | 'draft' | 'save' | 'publish' | 'upload' | 'activate' | 'wa'>('');
+  useEffect(() => { const el = chatBox.current; if (el) el.scrollTop = el.scrollHeight; }, [chat.length, busy]);
   const [error, setError] = useState('');
   const [draftId, setDraftId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -48,10 +58,48 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
     }).catch(() => setError('שגיאת רשת'));
   }, []);
 
-  const makeDraft = async () => {
+  useEffect(() => {
+    fetch('/api/meta-ads/wa-approval/settings').then(r => r.json()).then(d => { if (d?.success) setApprovers(d.approvers || []); }).catch(() => {});
+  }, []);
+
+  // one turn of the conversation - nothing is built yet
+  const talk = async () => {
+    const text = instruction.trim();
+    if (!text) return;
+    setBusy('talk'); setError('');
+    setChat(c => [...c, { role: 'owner', text }]);
+    setInstruction('');
+    try {
+      const d = await fetch('/api/meta-ads/briefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ briefId, text, baseCampaignId: briefId ? undefined : baseId }) }).then(r => r.json());
+      if (!d?.success) { setError(d?.error || 'נועם לא ענה'); setChat(c => c.slice(0, -1)); setInstruction(text); return; }
+      setBriefId(d.briefId);
+      if (d.cancel) { setChat([]); setBriefId(null); setReady(false); return; }
+      if (d.build && d.ready !== false) { setReady(true); setBusy(''); await makeDraft(d.briefId); return; }
+      setChat(c => [...c, { role: 'bot', text: d.reply || '' }]);
+      setReady(!!d.ready);
+    } catch (e: any) { setError(e?.message || 'שגיאת רשת'); } finally { setBusy(b => (b === 'talk' ? '' : b)); }
+  };
+  const restart = () => { setChat([]); setBriefId(null); setReady(false); setDraft(null); setDraftId(null); setCtx(null); setError(''); };
+
+  const saveApprovers = async (list: { name: string; phone: string }[]) => {
+    const d = await fetch('/api/meta-ads/wa-approval/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approvers: list }) }).then(r => r.json()).catch(() => null);
+    if (d?.success) setApprovers(d.approvers || []); else setError(d?.error || 'השמירה נכשלה');
+  };
+  const sendApproval = async () => {
+    if (!draftId) return;
+    setBusy('wa'); setWaResult(''); setError('');
+    const d = await fetch(`/api/meta-ads/drafts/${draftId}/send-approval`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+    setBusy('');
+    if (d?.results) setWaResult(d.results.map((r: any) => `${r.name || r.phone}: ${r.ok ? (r.via === 'template' ? '✓ נשלחה התראה (יראה את הטיוטה כשיענה)' : '✓ נשלח') : `✗ ${r.error}`}`).join(' · '));
+    else setError(d?.error || 'השליחה נכשלה');
+  };
+
+  const makeDraft = async (fromBrief?: number) => {
+    const bid = fromBrief || briefId;
+    if (!bid) return;
     setBusy('draft'); setError(''); setResult(null);
     try {
-      const d = await fetch('/api/meta-ads/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction, baseCampaignId: baseId }) }).then(r => r.json());
+      const d = await fetch(`/api/meta-ads/briefs/${bid}/build`, { method: 'POST' }).then(r => r.json());
       if (!d?.success) { setError(d?.error || 'כתיבת הטיוטה נכשלה'); return; }
       setDraftId(d.id); setDraft(d.draft); setCtx(d.context); setProblems(d.problems || []); setUnmatched(d.unmatchedPlaces || []);
     } catch (e: any) { setError(e?.message || 'שגיאת רשת'); } finally { setBusy(''); }
@@ -117,27 +165,48 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
       <div className="bg-white rounded-xl border border-gray-200 p-4 space-y-4 text-sm">
         <div>
           <h3 className="font-bold text-gray-800">✨ קמפיין חדש מהוראה</h3>
-          <p className="text-xs text-gray-500">כותבים מה רוצים - ה-AI בונה טיוטה על בסיס קמפיין שעבד, אתם בודקים ומאשרים, והוא עולה למטא מושהה.</p>
+          <p className="text-xs text-gray-500">כותבים מה רוצים - נועם מסכם מה הבין ושואל מה שלא ברור, ורק אחרי שתאשרו בונה טיוטה על בסיס קמפיין שעבד. אפשר לאשר גם בוואטסאפ. הקמפיין עולה למטא מושהה.</p>
         </div>
 
-        {/* 1. the instruction */}
-        {!result && (
+        {/* 1. the conversation - what was understood, questions, and only then the build */}
+        {!result && !draft && (
           <div className="space-y-2">
-            <textarea value={instruction} onChange={e => setInstruction(e.target.value)} rows={3} disabled={!!busy}
-              placeholder='למשל: "קמפיין לידים לחיפה והקריות, 60 ש"ח ליום, גילאי 35+, להדגיש בדיקת ראייה חינם"'
+            {chat.length === 0 && (
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-gray-600">על בסיס הקמפיין:</span>
+                {bases ? (
+                  <select value={baseId} onChange={e => setBaseId(e.target.value)} disabled={!!busy} className={`${input} max-w-full`}>
+                    {bases.map(b => <option key={b.id} value={b.id}>{b.name} · {b.leads30} לידים ב-30 יום</option>)}
+                  </select>
+                ) : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              </div>
+            )}
+            {chat.length > 0 && (
+              <div ref={chatBox} className="space-y-2 bg-gray-50 rounded-xl p-2 max-h-[28rem] overflow-y-auto">
+                {chat.map((m, i) => (
+                  <div key={i} className={`flex ${m.role === 'owner' ? 'justify-start' : 'justify-end'}`}>
+                    <div className={`max-w-[85%] rounded-xl px-3 py-2 text-sm whitespace-pre-wrap ${m.role === 'owner' ? 'bg-blue-600 text-white' : 'bg-white border border-gray-200 text-gray-800'}`}>
+                      {m.role === 'bot' && <div className="text-[10px] text-gray-400 mb-0.5">נועם</div>}
+                      {richText(m.text)}
+                    </div>
+                  </div>
+                ))}
+                {busy === 'talk' && <div className="flex justify-end"><div className="bg-white border border-gray-200 rounded-xl px-3 py-2 text-xs text-gray-500 flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> נועם חושב…</div></div>}
+              </div>
+            )}
+            {ready && busy !== 'draft' && (
+              <button onClick={() => makeDraft()} disabled={!!busy} className="w-full bg-[#075E54] text-white font-bold rounded-xl py-2.5 disabled:opacity-50">✅ כן, זה מה שאני רוצה — בנה טיוטה</button>
+            )}
+            <textarea value={instruction} onChange={e => setInstruction(e.target.value)} rows={chat.length ? 2 : 3} disabled={!!busy}
+              onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) talk(); }}
+              placeholder={chat.length ? (ready ? 'או כתבו מה לתקן…' : 'התשובה שלכם…') : 'למשל: "קמפיין לידים לחיפה והקריות, 60 ש"ח ליום, גילאי 35+, להדגיש בדיקת ראייה חינם"'}
               className="w-full border border-gray-300 rounded-lg p-2" />
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-gray-600">על בסיס הקמפיין:</span>
-              {bases ? (
-                <select value={baseId} onChange={e => setBaseId(e.target.value)} disabled={!!busy} className={`${input} max-w-full`}>
-                  {bases.map(b => <option key={b.id} value={b.id}>{b.name} · {b.leads30} לידים ב-30 יום</option>)}
-                </select>
-              ) : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-              <button onClick={makeDraft} disabled={!instruction.trim() || !baseId || !!busy} className="bg-[#075E54] text-white font-bold rounded-lg px-3 py-1.5 disabled:opacity-50">
-                {busy === 'draft' ? 'בונה טיוטה…' : draft ? 'בנה טיוטה מחדש' : 'בנה טיוטה'}
-              </button>
+            <div className="flex items-center gap-2 text-xs">
+              <button onClick={talk} disabled={!instruction.trim() || !baseId || !!busy} className="bg-blue-600 text-white font-bold rounded-lg px-4 py-1.5 disabled:opacity-50">{chat.length ? 'שלח' : 'התחל'}</button>
+              {chat.length > 0 && <button onClick={restart} disabled={!!busy} className="text-gray-500 underline">להתחיל מחדש</button>}
+              <span className="text-gray-400">נועם יסכם מה הבין וישאל מה שלא ברור - שום דבר לא נבנה עד שתאשרו.</span>
             </div>
-            {busy === 'draft' && <p className="text-xs text-gray-500 flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> קורא את קמפיין הבסיס וכותב טיוטה… (עד דקה)</p>}
+            {busy === 'draft' && <p className="text-xs text-gray-500 flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> בונה את הטיוטה לפי מה שסיכמנו… (עד דקה)</p>}
           </div>
         )}
         {error && <p className="text-xs text-red-700 bg-red-50 rounded-lg p-2">{error}</p>}
@@ -234,6 +303,27 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
               {busy === 'upload' && <span className="text-gray-500 mr-2 inline-flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> {uploadPct}</span>}
             </div>
 
+            {/* send to the approvers on WhatsApp (נועם asks them, they answer with a tap) */}
+            <div className="space-y-1.5 text-xs bg-green-50 border border-green-200 rounded-lg p-2">
+              <div className="font-bold text-gray-700">📲 אישור בוואטסאפ דרך נועם</div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {approvers.map((a, i) => (
+                  <span key={a.phone} className="inline-flex items-center gap-1 bg-white border border-gray-300 rounded-full px-2 py-0.5">
+                    {a.name || 'מאשר'} · 0{a.phone.slice(3)}
+                    <button onClick={() => saveApprovers(approvers.filter((_, j) => j !== i))}><X className="w-3 h-3" /></button>
+                  </span>
+                ))}
+                <input value={newApprover.name} onChange={e => setNewApprover({ ...newApprover, name: e.target.value })} placeholder="שם" className={`${input} w-20`} />
+                <input value={newApprover.phone} onChange={e => setNewApprover({ ...newApprover, phone: e.target.value })} placeholder="נייד" inputMode="tel" className={`${input} w-28`} />
+                <button disabled={newApprover.phone.replace(/\D/g, '').length < 9} onClick={() => { saveApprovers([...approvers, newApprover]); setNewApprover({ name: '', phone: '' }); }} className={btn}><Plus className="w-3 h-3" /> הוסף</button>
+              </div>
+              <button onClick={sendApproval} disabled={!approvers.length || !!busy || problems.length > 0} className="bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg px-3 py-1.5 disabled:opacity-50">
+                {busy === 'wa' ? 'שולח…' : '📲 שלח לאישור בוואטסאפ'}
+              </button>
+              {waResult && <p className="text-gray-700">{waResult}</p>}
+              <p className="text-[11px] text-gray-500">המאשר יקבל את הסיכום מהמספר של העסק, ויוכל לכתוב לנועם מה לשנות או ללחוץ "✅ מאשר להעלות" ואחר כך "▶️ להפעיל". אפשר גם להתחיל קמפיין ישר משם: לכתוב לנועם "קמפיין חדש…".</p>
+            </div>
+
             {problems.length > 0 && <ul className="text-xs text-amber-800 bg-amber-50 rounded-lg p-2 list-disc pr-5">{problems.map((p, i) => <li key={i}>{p}</li>)}</ul>}
             <button onClick={publish} disabled={!!busy || problems.length > 0} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl py-2.5 disabled:opacity-50">
               {busy === 'publish' ? 'מעלה למטא…' : '✅ אשר והעלה למטא (מושהה)'}
@@ -260,4 +350,9 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
       </div>
     </div>
   );
+}
+
+// the bot's *bold* (WhatsApp style) as bold
+function richText(t: string) {
+  return t.split(/(\*[^*\n]+\*)/g).map((part, i) => (part.length > 2 && part.startsWith('*') && part.endsWith('*') ? <b key={i}>{part.slice(1, -1)}</b> : <React.Fragment key={i}>{part}</React.Fragment>));
 }

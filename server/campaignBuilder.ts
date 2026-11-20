@@ -57,7 +57,7 @@ async function ensureDraftTable() {
 
 export type Place = { key: string; name: string; type: 'city' | 'region' | 'country'; region?: string; radiusKm?: number | null };
 
-async function searchPlaces(token: string, q: string): Promise<Place[]> {
+export async function searchPlaces(token: string, q: string): Promise<Place[]> {
   const r = await gget('search', token, { type: 'adgeolocation', q, location_types: JSON.stringify(['city', 'region', 'country']), limit: '8', locale: 'he_IL' });
   if (!r.ok) return [];
   return (r.data?.data || [])
@@ -129,7 +129,7 @@ export type Draft = {
   explanation?: string;
 };
 
-function cleanDraft(raw: any, ctx: any): Draft {
+export function cleanDraft(raw: any, ctx: any): Draft {
   const num = (v: any) => (v == null || v === '' ? null : Number(v));
   const age = (v: any) => { const n = num(v); return n == null || !isFinite(n) ? null : Math.min(65, Math.max(18, Math.round(n))); };
   const list = (v: any, max: number) => (Array.isArray(v) ? v : []).map((x: any) => String(x || '').slice(0, 2000)).filter((x: string) => x.trim()).slice(0, max);
@@ -152,7 +152,7 @@ function cleanDraft(raw: any, ctx: any): Draft {
 }
 
 // what's wrong with a draft before it can go to Meta (shown on the screen)
-function draftProblems(d: Draft, ctx: any): string[] {
+export function draftProblems(d: Draft, ctx: any): string[] {
   const out: string[] = [];
   const adv = d.advantageAudience ?? ctx.baseAdvantage;
   if (adv && d.ageMin && d.ageMin > 25) out.push('עם Advantage+ קהל מטא לא מאפשרת גיל מינימום מעל 25 - כבו את Advantage+ או הורידו את הגיל');
@@ -172,11 +172,12 @@ const SYSTEM = `אתה מנהל קמפיינים בכיר של Meta לעסק ק�
 - texts: 3 טקסטים ראשיים (bodies) ו-3 כותרות קצרות (titles) בעברית טבעית, ברוח הטקסטים שעבדו בבסיס ובהתאם להוראה (מבצע, עיר, קהל). אם יש מחיר/מבצע בטקסטים של הבסיס ולא נאמר אחרת - לשמור עליו מדויק. אפשר 0-2 descriptions. בלי הבטחות שלא נאמרו, בלי מחירים מומצאים.
 - name: שם קצר לקמפיין בעברית (מה, איפה, תאריך).
 - explanation: 2-4 משפטים: מה לקחת מהבסיס ומה שינית ולמה.
+אם יש agreed - זה מה שסוכם עם בעל העסק בשיחה לפני הבנייה (מיקום, תקציב, גיל, מסר...): לבנות בדיוק לפיו ולא לשנות דבר שסוכם.
 החזר JSON בלבד: { "name", "dailyBudgetIls", "places", "ageMin", "ageMax", "genders", "texts": { "bodies": [], "titles": [], "descriptions": [] }, "explanation" }`;
 
 // ---------- reading the base ----------
 
-async function readBase(creds: { token: string; accountId: string }, campaignId: string) {
+export async function readBase(creds: { token: string; accountId: string }, campaignId: string) {
   const { token, accountId } = creds;
   const [account, campaign, adsets, ins] = await Promise.all([
     gget(accountId, token, { fields: 'currency,min_daily_budget' }),
@@ -218,7 +219,7 @@ function adTexts(ad: any) {
   };
 }
 
-function contextOf(b: Base) {
+export function contextOf(b: Base) {
   return {
     baseName: b.campaign.name, baseCampaignId: String(b.campaign.id), baseAdsetId: String(b.best.id), baseAdsetName: b.best.name,
     objective: b.campaign.objective, cbo: b.cbo, currency: b.currency, rate: b.rate,
@@ -233,23 +234,7 @@ function contextOf(b: Base) {
 
 export function registerBuilderRoutes(app: express.Express) {
   // the campaigns to start from, the one with the most leads in 30 days first
-  app.get('/api/meta-ads/builder/bases', async (_req, res) => {
-    try {
-      const creds = await adsCredsForCurrentBusiness();
-      if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
-      const [camps, ins] = await Promise.all([
-        gget(`${creds.accountId}/campaigns`, creds.token, { fields: 'id,name,objective,effective_status', limit: '100' }),
-        gget(`${creds.accountId}/insights`, creds.token, { level: 'campaign', date_preset: 'last_30d', fields: 'campaign_id,spend,actions', limit: '200' }),
-      ]);
-      if (!camps.ok) return res.json({ success: false, error: metaErr(camps.data) });
-      const by = new Map<string, any>((ins.ok ? ins.data?.data || [] : []).map((r: any) => [String(r.campaign_id), r]));
-      const list = (camps.data?.data || []).map((c: any) => ({ id: String(c.id), name: c.name, objective: c.objective, status: c.effective_status, spend30: Number(by.get(String(c.id))?.spend) || 0, leads30: leadsOf(by.get(String(c.id))) }))
-        .sort((a: any, b: any) => b.leads30 - a.leads30 || b.spend30 - a.spend30);
-      res.json({ success: true, campaigns: list });
-    } catch (e: any) {
-      res.json({ success: false, error: e?.message });
-    }
-  });
+  app.get('/api/meta-ads/builder/bases', async (_req, res) => res.json(await listBases()));
 
   app.get('/api/meta-ads/geo-search', async (req, res) => {
     const creds = await adsCredsForCurrentBusiness();
@@ -258,45 +243,7 @@ export function registerBuilderRoutes(app: express.Express) {
   });
 
   // 1. the AI's draft
-  app.post('/api/meta-ads/drafts', async (req, res) => {
-    if (!db()) return res.json({ success: false, error: 'צריך מסד נתונים (DATABASE_URL)' });
-    try {
-      const creds = await adsCredsForCurrentBusiness();
-      if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
-      const instruction = String(req.body?.instruction || '').trim().slice(0, 2000);
-      const baseId = String(req.body?.baseCampaignId || '').replace(/\D/g, '');
-      if (!instruction) return res.json({ success: false, error: 'כתבו מה הקמפיין צריך להיות' });
-      if (!baseId) return res.json({ success: false, error: 'בחרו קמפיין בסיס' });
-      const base = await readBase(creds, baseId);
-      const ctx = contextOf(base);
-      const ai = await aiJson(SYSTEM, JSON.stringify({ instruction, base: ctx }), 'קמפיין חדש מהוראה', instruction.slice(0, 80));
-      if (!ai.text) return res.json({ success: false, error: `כתיבת הטיוטה נכשלה: ${ai.error}` });
-      const raw = parseJson(ai.text);
-      if (!raw) return res.json({ success: false, error: 'ה-AI החזיר תשובה לא קריאה - נסו שוב' });
-      // match the AI's place names to Meta's place list
-      const unmatched: string[] = [];
-      if (Array.isArray(raw.places) && raw.places.length) {
-        const found: Place[] = [];
-        for (const p of raw.places.slice(0, 15)) {
-          const hits = await searchPlaces(creds.token, String(p?.name || ''));
-          const hit = hits.find(h => h.type === 'city') || hits[0];
-          if (hit) found.push({ ...hit, radiusKm: hit.type === 'city' ? (p?.radiusKm ?? null) : null });
-          else unmatched.push(String(p?.name || ''));
-        }
-        raw.places = found;
-      }
-      const draft = cleanDraft(raw, ctx);
-      const p = await ensureDraftTable();
-      const ins = await p.query(
-        `INSERT INTO mk_drafts (tenant_id, created_by, instruction, base_campaign_id, base_adset_id, draft, context) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb) RETURNING id`,
-        [currentTenant(), who(), instruction, ctx.baseCampaignId, ctx.baseAdsetId, JSON.stringify(draft), JSON.stringify(ctx)],
-      );
-      res.json({ success: true, id: Number(ins.rows[0].id), draft, context: ctx, unmatchedPlaces: unmatched, problems: draftProblems(draft, ctx) });
-    } catch (e: any) {
-      console.error('[builder draft]', e?.message);
-      res.json({ success: false, error: e?.message || 'שגיאה' });
-    }
-  });
+  app.post('/api/meta-ads/drafts', async (req, res) => res.json(await createDraft({ instruction: req.body?.instruction, baseCampaignId: req.body?.baseCampaignId })));
 
   // 2. the person's edits
   app.put('/api/meta-ads/drafts/:id', async (req, res) => {
@@ -316,19 +263,83 @@ export function registerBuilderRoutes(app: express.Express) {
 
   // 3. to Meta: a new campaign (PAUSED) with one ad set and its ads
   app.post('/api/meta-ads/drafts/:id/publish', async (req, res) => {
+    const out = await publishDraft(Number(req.params.id));
+    res.status(out?.notFound ? 404 : 200).json(out);
+  });
+}
+
+export async function listBases(): Promise<any> {
+    try {
+      const creds = await adsCredsForCurrentBusiness();
+      if (!creds) return ({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
+      const [camps, ins] = await Promise.all([
+        gget(`${creds.accountId}/campaigns`, creds.token, { fields: 'id,name,objective,effective_status', limit: '100' }),
+        gget(`${creds.accountId}/insights`, creds.token, { level: 'campaign', date_preset: 'last_30d', fields: 'campaign_id,spend,actions', limit: '200' }),
+      ]);
+      if (!camps.ok) return ({ success: false, error: metaErr(camps.data) });
+      const by = new Map<string, any>((ins.ok ? ins.data?.data || [] : []).map((r: any) => [String(r.campaign_id), r]));
+      const list = (camps.data?.data || []).map((c: any) => ({ id: String(c.id), name: c.name, objective: c.objective, status: c.effective_status, spend30: Number(by.get(String(c.id))?.spend) || 0, leads30: leadsOf(by.get(String(c.id))) }))
+        .sort((a: any, b: any) => b.leads30 - a.leads30 || b.spend30 - a.spend30);
+      return ({ success: true, campaigns: list });
+    } catch (e: any) {
+      return ({ success: false, error: e?.message });
+    }
+}
+
+export async function createDraft(input: { instruction: string; baseCampaignId?: string; understood?: any }): Promise<any> {
+    if (!db()) return ({ success: false, error: 'צריך מסד נתונים (DATABASE_URL)' });
+    try {
+      const creds = await adsCredsForCurrentBusiness();
+      if (!creds) return ({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
+      const instruction = String(input.instruction || '').trim().slice(0, 2000);
+      const baseId = String(input.baseCampaignId || '').replace(/\D/g, '');
+      if (!instruction) return ({ success: false, error: 'כתבו מה הקמפיין צריך להיות' });
+      if (!baseId) return ({ success: false, error: 'בחרו קמפיין בסיס' });
+      const base = await readBase(creds, baseId);
+      const ctx = contextOf(base);
+      const ai = await aiJson(SYSTEM, JSON.stringify({ instruction, ...(input.understood ? { agreed: input.understood } : {}), base: ctx }), 'קמפיין חדש מהוראה', instruction.slice(0, 80));
+      if (!ai.text) return ({ success: false, error: `כתיבת הטיוטה נכשלה: ${ai.error}` });
+      const raw = parseJson(ai.text);
+      if (!raw) return ({ success: false, error: 'ה-AI החזיר תשובה לא קריאה - נסו שוב' });
+      // match the AI's place names to Meta's place list
+      const unmatched: string[] = [];
+      if (Array.isArray(raw.places) && raw.places.length) {
+        const found: Place[] = [];
+        for (const p of raw.places.slice(0, 15)) {
+          const hits = await searchPlaces(creds.token, String(p?.name || ''));
+          const hit = hits.find(h => h.type === 'city') || hits[0];
+          if (hit) found.push({ ...hit, radiusKm: hit.type === 'city' ? (p?.radiusKm ?? null) : null });
+          else unmatched.push(String(p?.name || ''));
+        }
+        raw.places = found;
+      }
+      const draft = cleanDraft(raw, ctx);
+      const p = await ensureDraftTable();
+      const ins = await p.query(
+        `INSERT INTO mk_drafts (tenant_id, created_by, instruction, base_campaign_id, base_adset_id, draft, context) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb) RETURNING id`,
+        [currentTenant(), who(), instruction, ctx.baseCampaignId, ctx.baseAdsetId, JSON.stringify(draft), JSON.stringify(ctx)],
+      );
+      return ({ success: true, id: Number(ins.rows[0].id), draft, context: ctx, unmatchedPlaces: unmatched, problems: draftProblems(draft, ctx) });
+    } catch (e: any) {
+      console.error('[builder draft]', e?.message);
+      return ({ success: false, error: e?.message || 'שגיאה' });
+    }
+}
+
+export async function publishDraft(draftId: number): Promise<any> {
     try {
       const p = await ensureDraftTable();
       const creds = await adsCredsForCurrentBusiness();
-      if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
-      const r = await p.query(`SELECT * FROM mk_drafts WHERE id = $1 AND tenant_id = $2`, [Number(req.params.id), currentTenant()]);
+      if (!creds) return ({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
+      const r = await p.query(`SELECT * FROM mk_drafts WHERE id = $1 AND tenant_id = $2`, [draftId, currentTenant()]);
       const row = r.rows[0];
-      if (!row) return res.status(404).json({ success: false, error: 'הטיוטה לא נמצאה' });
-      if (row.status !== 'draft') return res.json({ success: false, error: 'הטיוטה כבר הועלתה', published: row.published });
+      if (!row) return ({ success: false, error: 'הטיוטה לא נמצאה' });
+      if (row.status !== 'draft') return ({ success: false, error: 'הטיוטה כבר הועלתה', published: row.published });
       const draft: Draft = cleanDraft(row.draft, row.context);
       const base = await readBase(creds, String(row.base_campaign_id));
       const ctx = contextOf(base);
       const problems = draftProblems(draft, ctx);
-      if (problems.length) return res.json({ success: false, error: problems.join(' · ') });
+      if (problems.length) return ({ success: false, error: problems.join(' · ') });
       const { token, accountId } = creds;
       const minorFromIls = (ils: number) => Math.round((ils / (base.currency === 'ILS' || !base.rate ? 1 : base.rate)) * 100);
       const budgetMinor = Math.max(minorFromIls(draft.dailyBudgetIls), base.minDailyMinor || 0);
@@ -343,7 +354,7 @@ export function registerBuilderRoutes(app: express.Express) {
       if (base.cbo) { campBody.daily_budget = String(budgetMinor); if (base.campaign.bid_strategy) campBody.bid_strategy = base.campaign.bid_strategy; }
       let camp = await post(`${accountId}/campaigns`, token, campBody);
       if (!camp.ok && /is_adset_budget_sharing_enabled/.test(JSON.stringify(camp.data))) camp = await post(`${accountId}/campaigns`, token, { ...campBody, is_adset_budget_sharing_enabled: false });
-      if (!camp.ok || !camp.data?.id) return res.json({ success: false, error: `יצירת הקמפיין נכשלה: ${metaErr(camp.data)}` });
+      if (!camp.ok || !camp.data?.id) return ({ success: false, error: `יצירת הקמפיין נכשלה: ${metaErr(camp.data)}` });
       const campaignId = String(camp.data.id);
       steps.push('campaign');
       await p.query(
@@ -353,7 +364,7 @@ export function registerBuilderRoutes(app: express.Express) {
       );
       const fail = async (error: string) => {
         await p.query(`UPDATE mk_drafts SET published = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify({ campaignId, steps, error })]);
-        return res.json({ success: false, campaignId, error: `${error} (הקמפיין נוצר מושהה ואפשר לבטל אותו ב"שינויים שבוצעו")` });
+        return ({ success: false, campaignId, error: `${error} (הקמפיין נוצר מושהה ואפשר לבטל אותו ב"שינויים שבוצעו")` });
       };
 
       // the ad set - a copy of the base's best one with the approved targeting / budget
@@ -431,10 +442,9 @@ export function registerBuilderRoutes(app: express.Express) {
       steps.push('ads');
       const published = { campaignId, adsetId, ads: created, errors, at: new Date().toISOString() };
       await p.query(`UPDATE mk_drafts SET status = 'published', published = $2::jsonb, published_at = now() WHERE id = $1`, [row.id, JSON.stringify(published)]);
-      res.json({ success: true, ...published, name: draft.name });
+      return ({ success: true, ...published, name: draft.name });
     } catch (e: any) {
       console.error('[builder publish]', e?.message);
-      res.json({ success: false, error: e?.message || 'שגיאה' });
+      return ({ success: false, error: e?.message || 'שגיאה' });
     }
-  });
 }

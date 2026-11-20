@@ -11,6 +11,7 @@ import { registerAdsSnapshotRoutes } from './server/metaAdsSnapshot.js';
 import { registerOptimizerRoutes } from './server/campaignOptimizer.js';
 import { registerAdMediaRoutes } from './server/adMedia.js';
 import { registerBuilderRoutes } from './server/campaignBuilder.js';
+import { registerChatRoutes, registerBotRoutes } from './server/campaignChat.js';
 
 const requestHost = (req: express.Request) =>
   String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
@@ -33,6 +34,9 @@ export async function createApp({ serveFrontend }: { serveFrontend: boolean }) {
   });
 
   // --- everything else needs a signed-in business ---
+  // נועם (BotApp) calls these server-to-server with its own signed token (server/campaignChat.ts)
+  registerBotRoutes(app);
+
   app.use('/api', (req, res, next) => {
     const claims = verifySession(String(req.headers[SESSION_HEADER] || '').trim());
     if (!claims) {
@@ -54,6 +58,7 @@ export async function createApp({ serveFrontend }: { serveFrontend: boolean }) {
   registerAdMediaRoutes(app);
   // A new campaign from an instruction (draft → review → published PAUSED).
   registerBuilderRoutes(app);
+  registerChatRoutes(app);
 
   app.use('/api', (_req, res) => res.status(404).json({ success: false, error: 'not-found' }));
 

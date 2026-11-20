@@ -646,45 +646,7 @@ export function registerOptimizerRoutes(app: express.Express) {
   // A change the person makes by hand (age range, daily budget, pause / activate an ad set or ad):
   // the same checks as an AI suggestion (validate), then executed and logged the same way (undoable).
   // body: { action, targetId, params }
-  app.post('/api/meta-ads/campaigns/:id/manual-change', async (req, res) => {
-    if (!db()) return res.json({ success: false, error: 'כדי לבצע שינויים צריך מסד נתונים (DATABASE_URL ב-Vercel)' });
-    try {
-      const p = await ensureTables();
-      const creds = await adsCredsForCurrentBusiness();
-      if (!creds) return res.json({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
-      const campaignId = String(req.params.id).replace(/\D/g, '');
-      const { token, accountId } = creds;
-      const [account, campaign, adsets, ads, ruleSets] = await Promise.all([
-        gget(accountId, token, { fields: 'currency,min_daily_budget' }),
-        gget(campaignId, token, { fields: 'id,name,status,daily_budget,lifetime_budget,account_id' }),
-        allPages(`${campaignId}/adsets`, token, { fields: ADSET_FIELDS }),
-        allPages(`${campaignId}/ads`, token, { fields: 'id,name,adset_id,status' }),
-        allPages(`${accountId}/value_rule_set`, token, { fields: 'id,name,status' }),
-      ]);
-      if (!campaign.ok) return res.json({ success: false, error: metaErr(campaign.data) });
-      if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) return res.json({ success: false, error: 'הקמפיין לא שייך לחשבון המודעות של העסק' });
-      const currency = account.data?.currency || '';
-      const d: any = { currency, ilsRate: await ilsPerUnit(currency), minDailyBudget: num(account.data?.min_daily_budget), campaign: campaign.data, adsets: adsets.rows, ads: ads.rows, valueRuleSets: ruleSets.rows };
-      const b = req.body || {};
-      const sug = validate({ action: b.action, targetId: b.targetId, params: b.params || {}, title: String(b.title || 'שינוי ידני'), why: 'שינוי ידני', risk: 'low' }, d, 0);
-      if (!sug.executable) return res.json({ success: false, error: sug.note || 'השינוי הזה לא אפשרי' });
-      // a budget the person typed is executed as typed or not at all (an AI suggestion is trimmed instead)
-      if (sug.note && sug.before && 'daily_budget' in sug.before) {
-        const cur = num(sug.before.daily_budget) / 100;
-        return res.json({ success: false, error: `אפשר לשנות תקציב בעד 50% בבת אחת: בין ${round(cur * 0.5)} ל-${round(cur * 1.5)} ${({ USD: 'דולר', EUR: 'יורו', ILS: 'ש"ח' } as Record<string, string>)[currency] || currency} ליום${d.ilsRate && currency !== 'ILS' ? ` (₪${Math.round(cur * 0.5 * d.ilsRate)}–₪${Math.round(cur * 1.5 * d.ilsRate)})` : ''}` });
-      }
-      sug.id = 'm1';
-      const ins = await p.query(
-        `INSERT INTO mk_optimizations (tenant_id, campaign_id, campaign_name, created_by, analysis, suggestions) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id, created_at, campaign_id`,
-        [currentTenant(), campaignId, campaign.data?.name || null, who(), JSON.stringify({ manual: true }), JSON.stringify([sug])],
-      );
-      const results = await executeItems(p, creds, { ...ins.rows[0], suggestions: [sug] }, [{ suggestionId: 'm1' }]);
-      res.json({ success: !!results[0]?.ok, error: results[0]?.error, note: sug.note, change: { before: sug.before, after: sug.after, targetName: sug.targetName } });
-    } catch (e: any) {
-      console.error('[optimizer manual]', e?.message);
-      res.json({ success: false, error: e?.message || 'שגיאה בשינוי' });
-    }
-  });
+  app.post('/api/meta-ads/campaigns/:id/manual-change', async (req, res) => res.json(await manualChange(req.params.id, req.body)));
 
   app.get('/api/meta-ads/campaigns/:id/changes', async (req, res) => {
     if (!db()) return res.json({ success: true, changes: [], noDatabase: true });
@@ -734,4 +696,44 @@ export function registerOptimizerRoutes(app: express.Express) {
 function sumMetrics(list: any[]) {
   const t = list.filter(Boolean).reduce((a, m) => ({ spend: a.spend + m.spend, leads: a.leads + m.leads, clicks: a.clicks + m.clicks, impressions: a.impressions + m.impressions }), { spend: 0, leads: 0, clicks: 0, impressions: 0 });
   return { ...t, spend: round(t.spend), cpl: t.leads ? round(t.spend / t.leads) : null, ctr: t.impressions ? round((t.clicks / t.impressions) * 100) : null };
+}
+
+export async function manualChange(campaignIdIn: string, b0: any): Promise<any> {
+    if (!db()) return ({ success: false, error: 'כדי לבצע שינויים צריך מסד נתונים (DATABASE_URL ב-Vercel)' });
+    try {
+      const p = await ensureTables();
+      const creds = await adsCredsForCurrentBusiness();
+      if (!creds) return ({ success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' });
+      const campaignId = String(campaignIdIn).replace(/\D/g, '');
+      const { token, accountId } = creds;
+      const [account, campaign, adsets, ads, ruleSets] = await Promise.all([
+        gget(accountId, token, { fields: 'currency,min_daily_budget' }),
+        gget(campaignId, token, { fields: 'id,name,status,daily_budget,lifetime_budget,account_id' }),
+        allPages(`${campaignId}/adsets`, token, { fields: ADSET_FIELDS }),
+        allPages(`${campaignId}/ads`, token, { fields: 'id,name,adset_id,status' }),
+        allPages(`${accountId}/value_rule_set`, token, { fields: 'id,name,status' }),
+      ]);
+      if (!campaign.ok) return ({ success: false, error: metaErr(campaign.data) });
+      if (String(campaign.data?.account_id || '') && `act_${campaign.data.account_id}` !== accountId) return ({ success: false, error: 'הקמפיין לא שייך לחשבון המודעות של העסק' });
+      const currency = account.data?.currency || '';
+      const d: any = { currency, ilsRate: await ilsPerUnit(currency), minDailyBudget: num(account.data?.min_daily_budget), campaign: campaign.data, adsets: adsets.rows, ads: ads.rows, valueRuleSets: ruleSets.rows };
+      const b = b0 || {};
+      const sug = validate({ action: b.action, targetId: b.targetId, params: b.params || {}, title: String(b.title || 'שינוי ידני'), why: 'שינוי ידני', risk: 'low' }, d, 0);
+      if (!sug.executable) return ({ success: false, error: sug.note || 'השינוי הזה לא אפשרי' });
+      // a budget the person typed is executed as typed or not at all (an AI suggestion is trimmed instead)
+      if (sug.note && sug.before && 'daily_budget' in sug.before) {
+        const cur = num(sug.before.daily_budget) / 100;
+        return ({ success: false, error: `אפשר לשנות תקציב בעד 50% בבת אחת: בין ${round(cur * 0.5)} ל-${round(cur * 1.5)} ${({ USD: 'דולר', EUR: 'יורו', ILS: 'ש"ח' } as Record<string, string>)[currency] || currency} ליום${d.ilsRate && currency !== 'ILS' ? ` (₪${Math.round(cur * 0.5 * d.ilsRate)}–₪${Math.round(cur * 1.5 * d.ilsRate)})` : ''}` });
+      }
+      sug.id = 'm1';
+      const ins = await p.query(
+        `INSERT INTO mk_optimizations (tenant_id, campaign_id, campaign_name, created_by, analysis, suggestions) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id, created_at, campaign_id`,
+        [currentTenant(), campaignId, campaign.data?.name || null, who(), JSON.stringify({ manual: true }), JSON.stringify([sug])],
+      );
+      const results = await executeItems(p, creds, { ...ins.rows[0], suggestions: [sug] }, [{ suggestionId: 'm1' }]);
+      return ({ success: !!results[0]?.ok, error: results[0]?.error, note: sug.note, change: { before: sug.before, after: sug.after, targetName: sug.targetName } });
+    } catch (e: any) {
+      console.error('[optimizer manual]', e?.message);
+      return ({ success: false, error: e?.message || 'שגיאה בשינוי' });
+    }
 }

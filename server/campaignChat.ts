@@ -1,0 +1,548 @@
+// Building a campaign as a conversation, and approving it through נועם on WhatsApp (Haim, 2026-11-20:
+// "the build is a discussion - ask when something is unclear and first show what you understood until
+// the client approves, because every build takes time"; "add approval through נועם on WhatsApp").
+//
+// 1. The brief (`mk_briefs`): every message of the business owner gets a cheap AI turn that answers
+//    "this is what I understood" + up to 3 questions about what's unclear. Nothing is built yet.
+//    Only when the previous turn was `ready` (everything clear, the summary shown) and the owner
+//    confirms, the draft is built (`createDraft` with the agreed points) - the slow part, once.
+// 2. The draft is reviewed (the app's screen, or its summary on WhatsApp with "✅ מאשר להעלות"),
+//    changed in words ("תקציב 50", "להוסיף את נשר") without rebuilding, then uploaded PAUSED, and
+//    "▶️ להפעיל" turns it on - each step only after the owner said so.
+//
+// WhatsApp: the business's approvers (`mk_wa_settings.approvers` - name + phone, set in the app) talk
+// to the business's own WhatsApp number. BotApp (the bot נועם) asks GET /api/bot/approvers which
+// numbers are approvers, and passes their messages to POST /api/bot/owner-message (`x-bot-token`, JWT
+// with SSO_SHARED_SECRET, typ 'marketing-bot', portalTenantId). Here it's decided whether the message
+// is about a campaign (`handled`) - if not, the bot answers it as usual. Answers go out through
+// BotApp's POST /api/marketing/notify (the business's WhatsApp number, buttons). Outside Meta's 24h
+// window (the approver hasn't written to the number in the last 23h) a free message can't be sent, so
+// the business's alert template goes out ("השיבו כאן כדי לראות") and the full message waits for the
+// reply (`prompt.kind = 'show'`).
+import express from 'express';
+import jwt from 'jsonwebtoken';
+import { db, ensureTables } from './db.js';
+import { aiJson } from './ai.js';
+import { currentTenant, currentUser, runWithTenant, OPTICS_TENANT } from './tenant.js';
+import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
+import { listBases, createDraft, publishDraft, readBase, contextOf, cleanDraft, draftProblems, searchPlaces, type Draft } from './campaignBuilder.js';
+import { manualChange, parseJson } from './campaignOptimizer.js';
+
+const BOTAPP_URL = (process.env.BOTAPP_URL || 'https://app.smartesek.com').replace(/\/$/, '');
+const WA_URL = (process.env.WHATSAPP_URL || 'https://whatsapp.smartesek.com').replace(/\/$/, '');
+const OPTICS_ALERT_TEMPLATE = 'optica_template_545_copy_3286'; // name / phone / content - the optics' WABA only
+const FRESH_MS = 72 * 3600 * 1000; // a question / prompt older than this is forgotten
+const WINDOW_MS = 23 * 3600 * 1000; // Meta's 24h window, with a margin
+// a message that starts a campaign conversation on WhatsApp when nothing is open
+const MARKETING_RE = /קמפיין|ממומן|מודע(?:ה|ות)\s|פרסו?ם\s?ב?(?:פייסבוק|אינסטגרם|מטא)|תקציב\s?(?:פרסום|יומי)/;
+const YES_RE = /^\s*(?:✅\s*)?(?:כן|מאשר|מאשרת|אישור|מאושר|יאללה|סבבה|אוקיי|אוקי|ok|okay|בסדר|תעלה|תעלי|לבנות|תבנה|תבני|להפעיל|תפעיל|תפעילי|קדימה|נכון)(?=[\s!.,]|$)[\s!.,]*$/i;
+const NO_RE = /^\s*(?:❌\s*)?(?:לא|ביטול|בטל|בטלי|לא עכשיו|עזוב|עזבי|תעצור|stop)(?=[\s!.,]|$)[\s!.,]*$/i;
+
+const last9 = (p: unknown) => String(p || '').replace(/\D/g, '').slice(-9);
+const intl = (p: unknown) => { const n = last9(p); return n.length === 9 ? `972${n}` : ''; };
+const who = () => currentUser()?.email || 'unknown';
+
+type Button = { id: string; title: string };
+type OutMsg = { text: string; buttons?: Button[] };
+type Approver = { name: string; phone: string };
+
+let tablesReady = false;
+async function ensureChatTables() {
+  const p = await ensureTables();
+  if (tablesReady) return p;
+  await p.query(`CREATE TABLE IF NOT EXISTS mk_briefs (
+    id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, channel TEXT NOT NULL, phone TEXT, created_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status TEXT NOT NULL DEFAULT 'talking', messages JSONB NOT NULL DEFAULT '[]'::jsonb, understood JSONB,
+    ready BOOLEAN NOT NULL DEFAULT false, base_campaign_id TEXT, draft_id BIGINT)`);
+  await p.query(`CREATE TABLE IF NOT EXISTS mk_wa_settings (
+    tenant_id TEXT PRIMARY KEY, approvers JSONB NOT NULL DEFAULT '[]'::jsonb, template TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_by TEXT)`);
+  await p.query(`CREATE TABLE IF NOT EXISTS mk_wa_threads (
+    tenant_id TEXT NOT NULL, phone9 TEXT NOT NULL, last_inbound_at TIMESTAMPTZ, prompt JSONB, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, phone9))`);
+  tablesReady = true;
+  return p;
+}
+
+// ---------- settings ----------
+
+async function getSettings(): Promise<{ approvers: Approver[]; template: string }> {
+  const p = await ensureChatTables();
+  const r = await p.query(`SELECT approvers, template FROM mk_wa_settings WHERE tenant_id = $1`, [currentTenant()]);
+  const row = r.rows[0];
+  return {
+    approvers: Array.isArray(row?.approvers) ? row.approvers : [],
+    template: row?.template || (currentTenant() === OPTICS_TENANT ? OPTICS_ALERT_TEMPLATE : ''),
+  };
+}
+
+// ---------- the thread with one approver (the 24h window, the question waiting for an answer) ----------
+
+async function thread(phone: string): Promise<{ last_inbound_at: Date | null; prompt: any }> {
+  const p = await ensureChatTables();
+  const r = await p.query(`SELECT last_inbound_at, prompt FROM mk_wa_threads WHERE tenant_id = $1 AND phone9 = $2`, [currentTenant(), last9(phone)]);
+  return r.rows[0] || { last_inbound_at: null, prompt: null };
+}
+async function setPrompt(phone: string, prompt: any) {
+  const p = await ensureChatTables();
+  await p.query(
+    `INSERT INTO mk_wa_threads (tenant_id, phone9, prompt) VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (tenant_id, phone9) DO UPDATE SET prompt = EXCLUDED.prompt, updated_at = now()`,
+    [currentTenant(), last9(phone), prompt ? JSON.stringify({ ...prompt, at: new Date().toISOString() }) : null],
+  );
+}
+async function noteInbound(phone: string) {
+  const p = await ensureChatTables();
+  await p.query(
+    `INSERT INTO mk_wa_threads (tenant_id, phone9, last_inbound_at) VALUES ($1, $2, now())
+     ON CONFLICT (tenant_id, phone9) DO UPDATE SET last_inbound_at = now(), updated_at = now()`,
+    [currentTenant(), last9(phone)],
+  );
+}
+const fresh = (prompt: any) => prompt?.at && Date.now() - new Date(prompt.at).getTime() < FRESH_MS;
+
+// ---------- sending to an approver ----------
+
+async function viaBotApp(phone: string, messages: OutMsg[]): Promise<{ ok: boolean; error?: string }> {
+  const secret = process.env.SSO_SHARED_SECRET;
+  if (!secret) return { ok: false, error: 'חסר SSO_SHARED_SECRET' };
+  const token = jwt.sign({ typ: 'marketing-notify', portalTenantId: currentTenant() }, secret, { expiresIn: '2m' });
+  try {
+    const r = await fetch(`${BOTAPP_URL}/api/marketing/notify`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-marketing-token': token },
+      body: JSON.stringify({ phone: intl(phone), messages }), signal: AbortSignal.timeout(20000),
+    });
+    const d: any = await r.json().catch(() => ({}));
+    return d?.success ? { ok: true } : { ok: false, error: d?.error || `BotApp ${r.status}` };
+  } catch (e: any) {
+    return { ok: false, error: `BotApp: ${e?.message || e}` };
+  }
+}
+
+async function viaTemplate(phone: string, template: string, content: string): Promise<{ ok: boolean; error?: string }> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (currentTenant() !== OPTICS_TENANT) {
+    const secret = process.env.SSO_SHARED_SECRET;
+    if (!secret) return { ok: false, error: 'חסר SSO_SHARED_SECRET' };
+    headers['x-wa-session'] = jwt.sign({ tenantId: currentTenant(), email: 'marketing@smartesek.com', role: 'crm', typ: 'wa_session' }, secret, { expiresIn: '5m' });
+  }
+  const param = (t: string) => t.replace(/[\n\r\t]+/g, ' ').replace(/ {2,}/g, ' ').trim();
+  try {
+    const r = await fetch(`${WA_URL}/api/meta/send-template`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ to: intl(phone), templateName: template, languageCode: 'he', parameters: ['נועם · מערכת השיווק', '-', param(content).slice(0, 900)] }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const d: any = await r.json().catch(() => ({}));
+    return d?.success ? { ok: true } : { ok: false, error: typeof d?.error === 'string' ? d.error : `WhatsApp ${r.status}` };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+// To an approver: a free message inside the 24h window, else the template + the message waits for the reply
+export async function sendToOwner(phone: string, messages: OutMsg[], shortLine: string, prompt?: any): Promise<{ ok: boolean; via?: string; error?: string }> {
+  const th = await thread(phone);
+  const inWindow = th.last_inbound_at && Date.now() - new Date(th.last_inbound_at).getTime() < WINDOW_MS;
+  if (inWindow) {
+    const r = await viaBotApp(phone, messages);
+    if (r.ok && prompt !== undefined) await setPrompt(phone, prompt);
+    return { ...r, via: 'message' };
+  }
+  const { template } = await getSettings();
+  if (!template) return { ok: false, error: 'לא כתב/ה למספר של הבוט ב-24 השעות האחרונות, ולעסק אין תבנית התראה - שיכתוב/תכתוב "קמפיין" למספר הוואטסאפ של העסק, ואז לשלוח שוב' };
+  const r = await viaTemplate(phone, template, `${shortLine} - השיבו כאן כל הודעה כדי לראות ולאשר`);
+  if (r.ok) await setPrompt(phone, { kind: 'show', pending: messages, then: prompt || null });
+  return { ...r, via: 'template' };
+}
+
+// ---------- texts ----------
+
+const GENDER_HE: Record<string, string> = { female: 'נשים', male: 'גברים', all: 'כולם' };
+
+export function draftSummary(id: number, d: Draft, ctx: any, problems: string[]): OutMsg {
+  const places = d.places?.length
+    ? d.places.map(p => `${p.name}${p.radiusKm ? ` +${p.radiusKm} ק"מ` : ''}`).join(', ')
+    : `כמו בבסיס (${(ctx.baseTargeting?.places || []).join(', ') || '—'})`;
+  const age = d.ageMin || d.ageMax ? `${d.ageMin || 18}–${d.ageMax || 65}` : `כמו בבסיס (${ctx.baseTargeting?.age || '—'})`;
+  const lines = [
+    `✨ *טיוטת קמפיין: ${d.name}*`,
+    `• מבוסס על: "${ctx.baseName}" (${ctx.bestLeads30} לידים ב-30 יום)`,
+    `• תקציב: *₪${d.dailyBudgetIls} ליום*`,
+    `• מיקום: ${places}`,
+    `• גיל: ${age}${d.genders ? ` · ${GENDER_HE[d.genders]}` : ''}`,
+    `• מודעות: ${ctx.baseAds?.length || 0}${d.media.length ? ` עם ${d.media.length} תמונות / סרטונים חדשים` : ' עם התמונות / הסרטונים של הבסיס'}`,
+    '',
+    `*טקסט ראשי:* ${d.texts.bodies[0] || '—'}`,
+    d.texts.titles.length ? `*כותרות:* ${d.texts.titles.join(' · ')}` : '',
+  ].filter(l => l !== '');
+  if (problems.length) {
+    lines.push('', '⚠️ *צריך לתקן לפני העלאה:*', ...problems.map(p => `• ${p}`), '', 'כתבו לי מה לשנות.');
+    return { text: lines.join('\n') };
+  }
+  lines.push('', 'אפשר לכתוב לי מה לשנות (למשל "תקציב 50", "להוסיף את נשר"), או לאשר. הקמפיין יעלה *מושהה* - שום כסף לא יוצא עד שתפעילו.');
+  return { text: lines.join('\n'), buttons: [{ id: `mk_pub_${id}`, title: '✅ מאשר להעלות' }, { id: `mk_no_${id}`, title: '❌ לא עכשיו' }] };
+}
+
+// ---------- the brief: what was understood, questions, and building only after a yes ----------
+
+const BRIEF_SYSTEM = `אתה נועם, העוזר השיווקי של העסק. בעל העסק מתאר קמפיין חדש במטא (פייסבוק / אינסטגרם). עדיין לא בונים - קודם מבינים.
+בכל תשובה: מסכמים בקצרה מה הבנת עד עכשיו, ושואלים רק על מה שבאמת לא ברור או סותר (עד 3 שאלות, החשובה ראשונה).
+מה צריך להיות ברור לפני בנייה:
+- על בסיס איזה קמפיין (מהרשימה bases; אם לא נאמר - הקמפיין עם הכי הרבה לידים, ותגיד את זה).
+- איפה (ערים / אזורים, רדיוס אם נאמר). אם לא נאמר - כמו בבסיס, ותגיד מה זה.
+- תקציב יומי בשקלים. אם לא נאמר - כמו בבסיס (base.baseDailyIls), ותגיד.
+- גיל / מגדר - רק אם נאמר משהו או שזה חשוב להצעה.
+- מה המסר / ההצעה (מחיר, מבצע, מה להדגיש). אם לא נאמר - כמו בטקסטים של הבסיס.
+- מדיה: התמונות / הסרטונים של הבסיס, או חדשים (חדשים מעלים באפליקציה, במסך הטיוטה).
+אל תשאל על דברים שיש להם ברירת מחדל סבירה - פשוט תכתוב "כמו בבסיס: ...". אל תמציא מחירים או הבטחות.
+ready = true רק כשאין שאלה פתוחה. אז הסיכום מסתיים ב"לבנות את הטיוטה?".
+build = true רק כשבעל העסק מאשר עכשיו לבנות (כן / מאשר / תבנה) ואין שום שינוי בהודעה שלו.
+cancel = true כשהוא מבקש לעזוב / לבטל את הקמפיין.
+offTopic = true כשההודעה בכלל לא קשורה לקמפיין (למשל שאלה של לקוח, בדיקה של הבוט).
+reply: קצר, עברית טבעית, בלי מגדר, מתאים לוואטסאפ: *מודגש* לכותרות, "•" לרשימות.
+החזר JSON בלבד: { "reply", "understood": { "baseCampaignId", "baseCampaignName", "places": [{ "name", "radiusKm" }] או null, "dailyBudgetIls" או null, "ageMin", "ageMax", "genders" ("all"|"female"|"male"|null), "offer", "emphasis", "media", "other" }, "questions": [], "ready", "build", "cancel", "offTopic" }`;
+
+type Brief = { id: number; status: string; messages: { role: 'owner' | 'bot'; text: string; at: string }[]; understood: any; ready: boolean; base_campaign_id: string | null; draft_id: number | null; channel: string; phone: string | null };
+
+async function loadBrief(id: number): Promise<Brief | null> {
+  const p = await ensureChatTables();
+  const r = await p.query(`SELECT * FROM mk_briefs WHERE id = $1 AND tenant_id = $2`, [id, currentTenant()]);
+  return r.rows[0] ? { ...r.rows[0], id: Number(r.rows[0].id), draft_id: r.rows[0].draft_id ? Number(r.rows[0].draft_id) : null } : null;
+}
+
+async function openWaBrief(phone: string): Promise<Brief | null> {
+  const p = await ensureChatTables();
+  const r = await p.query(
+    `SELECT id FROM mk_briefs WHERE tenant_id = $1 AND channel = 'whatsapp' AND phone = $2 AND status = 'talking' AND updated_at > now() - interval '72 hours' ORDER BY id DESC LIMIT 1`,
+    [currentTenant(), last9(phone)],
+  );
+  return r.rows[0] ? loadBrief(Number(r.rows[0].id)) : null;
+}
+
+export type BriefTurn = { success: boolean; error?: string; briefId?: number; reply?: string; understood?: any; questions?: string[]; ready?: boolean; build?: boolean; cancel?: boolean; offTopic?: boolean; messages?: Brief['messages'] };
+
+// One turn of the conversation. Nothing is built here.
+export async function briefTurn(input: { briefId?: number | null; text: string; channel: 'app' | 'whatsapp'; phone?: string; baseCampaignId?: string }): Promise<BriefTurn> {
+  if (!db()) return { success: false, error: 'צריך מסד נתונים (DATABASE_URL)' };
+  const text = String(input.text || '').trim().slice(0, 2000);
+  if (!text) return { success: false, error: 'כתבו מה הקמפיין צריך להיות' };
+  const creds = await adsCredsForCurrentBusiness();
+  if (!creds) return { success: false, error: 'חסר טוקן פרסום של פייסבוק בפורטל' };
+  const p = await ensureChatTables();
+  let brief = input.briefId ? await loadBrief(Number(input.briefId)) : null;
+  if (brief && brief.status !== 'talking') brief = null; // a built / closed one isn't continued
+  const bases = await listBases();
+  if (!bases?.success) return { success: false, error: bases?.error || 'לא הצלחנו לקרוא את הקמפיינים' };
+  const baseId = String(input.baseCampaignId || brief?.understood?.baseCampaignId || brief?.base_campaign_id || bases.campaigns[0]?.id || '').replace(/\D/g, '');
+  let base: any = null;
+  if (baseId) {
+    try { base = contextOf(await readBase(creds, baseId)); } catch (e: any) { base = { error: e?.message }; }
+  }
+  const history = brief?.messages || [];
+  const ai = await aiJson(BRIEF_SYSTEM, JSON.stringify({
+    today: new Date().toISOString().slice(0, 10),
+    bases: bases.campaigns.slice(0, 10).map((c: any) => ({ id: c.id, name: c.name, leads30: c.leads30, spend30: c.spend30, status: c.status })),
+    base: base && !base.error ? { id: baseId, name: base.baseName, adset: base.baseAdsetName, dailyIls: base.baseDailyIls, targeting: base.baseTargeting, texts: base.baseAds?.map((a: any) => a.bodies?.[0]).filter(Boolean).slice(0, 3) } : null,
+    understoodSoFar: brief?.understood || null,
+    lastSummaryWasReady: !!brief?.ready,
+    conversation: history.slice(-16),
+    newMessage: text,
+  }), 'שיחה על קמפיין חדש', text.slice(0, 80));
+  if (!ai.text) return { success: false, error: `ה-AI לא ענה: ${ai.error}` };
+  const out = parseJson(ai.text);
+  if (!out || typeof out.reply !== 'string') return { success: false, error: 'ה-AI החזיר תשובה לא קריאה - נסו שוב' };
+  if (out.offTopic && !brief) return { success: true, offTopic: true };
+  const now = new Date().toISOString();
+  // build only after the summary was shown as ready AND the owner says yes now
+  const build = !!out.build && !!brief?.ready;
+  const ready = !!out.ready && !(out.questions || []).length;
+  const understood = out.understood && typeof out.understood === 'object' ? out.understood : brief?.understood || null;
+  if (understood && !understood.baseCampaignId && baseId) understood.baseCampaignId = baseId;
+  const messages = [...history, { role: 'owner' as const, text, at: now }, ...(build || out.offTopic ? [] : [{ role: 'bot' as const, text: out.reply, at: now }])];
+  const status = out.cancel ? 'closed' : 'talking';
+  let id = brief?.id;
+  if (brief) {
+    await p.query(`UPDATE mk_briefs SET messages = $2::jsonb, understood = $3::jsonb, ready = $4, status = $5, base_campaign_id = $6, updated_at = now() WHERE id = $1`,
+      [brief.id, JSON.stringify(messages), JSON.stringify(understood), build ? true : ready, status, String(understood?.baseCampaignId || baseId || '') || null]);
+  } else {
+    const ins = await p.query(
+      `INSERT INTO mk_briefs (tenant_id, channel, phone, created_by, messages, understood, ready, base_campaign_id, status) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9) RETURNING id`,
+      [currentTenant(), input.channel, input.phone ? last9(input.phone) : null, who(), JSON.stringify(messages), JSON.stringify(understood), ready, String(understood?.baseCampaignId || baseId || '') || null, status],
+    );
+    id = Number(ins.rows[0].id);
+  }
+  return { success: true, briefId: id, reply: out.reply, understood, questions: Array.isArray(out.questions) ? out.questions.slice(0, 3) : [], ready, build, cancel: !!out.cancel, offTopic: !!out.offTopic, messages };
+}
+
+// The slow part, once: the draft from the agreed points
+export async function buildFromBrief(briefId: number): Promise<any> {
+  const brief = await loadBrief(briefId);
+  if (!brief) return { success: false, error: 'השיחה לא נמצאה' };
+  if (brief.draft_id) return { success: false, error: 'הטיוטה כבר נבנתה', draftId: brief.draft_id };
+  const instruction = brief.messages.map(m => `${m.role === 'owner' ? 'בעל העסק' : 'נועם'}: ${m.text}`).join('\n').slice(-6000);
+  const out = await createDraft({ instruction, baseCampaignId: brief.understood?.baseCampaignId || brief.base_campaign_id || undefined, understood: brief.understood });
+  if (out?.success) {
+    const p = await ensureChatTables();
+    await p.query(`UPDATE mk_briefs SET status = 'built', draft_id = $2, updated_at = now() WHERE id = $1`, [briefId, out.id]);
+  }
+  return out;
+}
+
+// ---------- changing a draft in words (WhatsApp) - no rebuild ----------
+
+const EDIT_SYSTEM = `בעל העסק ענה על סיכום טיוטת קמפיין או על שאלת "להפעיל?". סווג את ההודעה.
+intent: "confirm" (מאשר את מה שנשאל), "decline" (לא עכשיו / לא לאשר), "edit" (רוצה לשנות משהו בטיוטה), "new" (רוצה קמפיין אחר / חדש), "other" (לא קשור לקמפיין).
+edits (רק ב-edit, רק מה שנאמר): { "dailyBudgetIls", "ageMin", "ageMax", "genders" ("all"|"female"|"male"), "advantageAudience" (true/false), "addPlaces": [{ "name", "radiusKm" }], "removePlaces": [שמות], "name", "bodies": [טקסטים חדשים], "titles": [כותרות חדשות] }.
+החזר JSON בלבד: { "intent", "edits" }`;
+
+async function classifyAnswer(text: string, prompt: any, draft: Draft | null): Promise<{ intent: string; edits?: any }> {
+  if (YES_RE.test(text)) return { intent: 'confirm' };
+  if (NO_RE.test(text)) return { intent: 'decline' };
+  const ai = await aiJson(EDIT_SYSTEM, JSON.stringify({ asked: prompt?.kind === 'act' ? 'להפעיל את הקמפיין?' : 'לאשר ולהעלות את הטיוטה?', draft, message: text }), 'אישור קמפיין בוואטסאפ', text.slice(0, 80));
+  const out = ai.text ? parseJson(ai.text) : null;
+  return out?.intent ? out : { intent: 'other' };
+}
+
+async function applyEdits(draftId: number, edits: any): Promise<{ ok: boolean; msg: OutMsg; unmatched: string[] }> {
+  const p = await ensureChatTables();
+  const r = await p.query(`SELECT * FROM mk_drafts WHERE id = $1 AND tenant_id = $2`, [draftId, currentTenant()]);
+  const row = r.rows[0];
+  if (!row || row.status !== 'draft') return { ok: false, msg: { text: 'הטיוטה הזו כבר הועלתה - אי אפשר לשנות אותה מכאן.' }, unmatched: [] };
+  const d: any = JSON.parse(JSON.stringify(row.draft));
+  const e = edits || {};
+  for (const k of ['dailyBudgetIls', 'ageMin', 'ageMax', 'genders', 'advantageAudience', 'name']) if (e[k] != null && e[k] !== '') d[k] = e[k];
+  if (Array.isArray(e.bodies) && e.bodies.length) d.texts.bodies = e.bodies;
+  if (Array.isArray(e.titles) && e.titles.length) d.texts.titles = e.titles;
+  const unmatched: string[] = [];
+  if (Array.isArray(e.removePlaces) && e.removePlaces.length && d.places) {
+    d.places = d.places.filter((pl: any) => !e.removePlaces.some((n: string) => String(pl.name).includes(n) || String(n).includes(pl.name)));
+    if (!d.places.length) d.places = null;
+  }
+  if (Array.isArray(e.addPlaces) && e.addPlaces.length) {
+    const creds = await adsCredsForCurrentBusiness();
+    for (const pl of e.addPlaces.slice(0, 10)) {
+      const hits = creds ? await searchPlaces(creds.token, String(pl?.name || '')) : [];
+      const hit = hits.find(h => h.type === 'city') || hits[0];
+      if (hit) d.places = [...(d.places || []).filter((x: any) => x.key !== hit.key), { ...hit, radiusKm: hit.type === 'city' ? pl?.radiusKm ?? null : null }];
+      else unmatched.push(String(pl?.name || ''));
+    }
+  }
+  const draft = cleanDraft(d, row.context);
+  await p.query(`UPDATE mk_drafts SET draft = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify(draft)]);
+  const msg = draftSummary(draftId, draft, row.context, draftProblems(draft, row.context));
+  if (unmatched.length) msg.text = `לא מצאתי במטא: ${unmatched.join(', ')} - נסו שם אחר.\n\n${msg.text}`;
+  return { ok: true, msg, unmatched };
+}
+
+async function draftRow(id: number) {
+  const p = await ensureChatTables();
+  const r = await p.query(`SELECT * FROM mk_drafts WHERE id = $1 AND tenant_id = $2`, [id, currentTenant()]);
+  return r.rows[0] || null;
+}
+
+// ---------- the owner's WhatsApp message ----------
+
+// Every answer is pushed through BotApp (notify), so a slow step (building / uploading) still reaches
+// the owner when BotApp stopped waiting. The return value only says whether the message was ours.
+async function ownerMessage(input: { phone: string; text: string; buttonId?: string; approver: Approver }): Promise<{ handled: boolean }> {
+  const phone = input.phone;
+  const text = String(input.text || '').trim();
+  const send = (msgs: OutMsg[], prompt?: any) => sendToOwner(phone, msgs, 'הודעה מנועם על הקמפיין', prompt);
+  await noteInbound(phone);
+  const th = await thread(phone);
+  const btn = /^mk_(pub|no|act|later|build|cancel)_(\d+)$/.exec(String(input.buttonId || ''));
+
+  // a message that was waiting for the 24h window (a template went out) - shown now
+  if (!btn && th.prompt?.kind === 'show' && fresh(th.prompt) && Array.isArray(th.prompt.pending)) {
+    await send(th.prompt.pending, th.prompt.then || null);
+    return { handled: true };
+  }
+
+  const act = async (kind: string, id: number) => {
+    if (kind === 'build') {
+      const brief = await loadBrief(id);
+      if (!brief || brief.status !== 'talking' || !brief.ready) { await send([{ text: 'אין כרגע סיכום שמחכה לבנייה. כתבו לי מה הקמפיין צריך להיות.' }], null); return; }
+      await viaBotApp(phone, [{ text: '⏳ בונה את הטיוטה על בסיס מה שסיכמנו... זה לוקח עד דקה.' }]);
+      const out = await buildFromBrief(id);
+      if (!out?.success) { await send([{ text: `לא הצלחתי לבנות את הטיוטה: ${out?.error || 'שגיאה'}` }], null); return; }
+      await send([draftSummary(out.id, out.draft, out.context, out.problems || [])], out.problems?.length ? { kind: 'edit', draftId: out.id } : { kind: 'pub', draftId: out.id });
+      return;
+    }
+    if (kind === 'cancel') {
+      const p = await ensureChatTables();
+      await p.query(`UPDATE mk_briefs SET status = 'closed', updated_at = now() WHERE id = $1 AND tenant_id = $2 AND status = 'talking'`, [id, currentTenant()]);
+      await send([{ text: 'בסדר, עזבתי את הקמפיין הזה. כשתרצו - כתבו לי "קמפיין חדש".' }], null);
+      return;
+    }
+    const row = await draftRow(id);
+    if (!row) { await send([{ text: 'לא מצאתי את הטיוטה הזו.' }], null); return; }
+    if (kind === 'no') { await send([{ text: 'בסדר, לא העליתי. הטיוטה שמורה במערכת השיווק ← "📣 ממומן".' }], null); return; }
+    if (kind === 'pub') {
+      if (row.status !== 'draft') { await send([{ text: `הקמפיין "${row.draft?.name}" כבר הועלה.` }], null); return; }
+      await viaBotApp(phone, [{ text: '⏳ מעלה למטא...' }]);
+      const out = await publishDraft(id);
+      if (!out?.success) { await send([{ text: `ההעלאה נכשלה: ${out?.error || 'שגיאה'}` }], null); return; }
+      await send([{
+        text: `✓ הקמפיין *"${out.name}"* נוצר במטא *מושהה*, עם ${out.ads.length} מודעות${out.errors?.length ? ` (חלק לא נוצרו: ${out.errors.join(' · ')})` : ''}.\n\nלהפעיל אותו עכשיו? מרגע ההפעלה מטא מתחילה להוציא *₪${row.draft?.dailyBudgetIls} ליום*.`,
+        buttons: [{ id: `mk_act_${id}`, title: '▶️ להפעיל' }, { id: `mk_later_${id}`, title: '⏸️ להשאיר מושהה' }],
+      }], { kind: 'act', draftId: id, campaignId: out.campaignId });
+      return;
+    }
+    const campaignId = row.published?.campaignId;
+    if (kind === 'later') { await send([{ text: 'נשאר מושהה. אפשר להפעיל מתי שתרצו במערכת השיווק או במנהל המודעות.' }], null); return; }
+    if (kind === 'act') {
+      if (!campaignId) { await send([{ text: 'הקמפיין עוד לא הועלה.' }], null); return; }
+      const out = await manualChange(String(campaignId), { action: 'activate_campaign', targetId: String(campaignId), params: {}, title: 'הפעלת קמפיין חדש (וואטסאפ)' });
+      await send([{ text: out?.success ? `▶️ הקמפיין *"${row.draft?.name}"* פועל. מטא בודקת מודעות חדשות לפני שהן רצות - בדרך כלל עד כמה שעות.` : `ההפעלה נכשלה: ${out?.error || 'שגיאה'}` }], null);
+    }
+  };
+
+  if (btn) { await act(btn[1], Number(btn[2])); return { handled: true }; }
+
+  // an answer to "approve / upload?" or "activate?"
+  if (fresh(th.prompt) && ['pub', 'act', 'edit'].includes(th.prompt.kind) && th.prompt.draftId) {
+    const row = await draftRow(Number(th.prompt.draftId));
+    const c = await classifyAnswer(text, th.prompt, row?.draft || null);
+    if (c.intent === 'confirm' && th.prompt.kind !== 'edit') { await act(th.prompt.kind, Number(th.prompt.draftId)); return { handled: true }; }
+    if (c.intent === 'decline') { await act(th.prompt.kind === 'act' ? 'later' : 'no', Number(th.prompt.draftId)); return { handled: true }; }
+    if (c.intent === 'edit' && th.prompt.kind !== 'act') {
+      const r = await applyEdits(Number(th.prompt.draftId), c.edits);
+      const okToPublish = r.ok && r.msg.buttons?.length;
+      await send([r.msg], r.ok ? { kind: okToPublish ? 'pub' : 'edit', draftId: Number(th.prompt.draftId) } : null);
+      return { handled: true };
+    }
+    if (c.intent === 'new') await setPrompt(phone, null);
+    else if (c.intent !== 'other') { await send([{ text: 'לא הבנתי - אפשר ללחוץ על אחד הכפתורים, או לכתוב מה לשנות.' }]); return { handled: true }; }
+    else return { handled: false }; // not about the campaign: the bot answers it as usual
+  }
+
+  // the conversation before building
+  const open = await openWaBrief(phone);
+  if (!open && !MARKETING_RE.test(text)) return { handled: false };
+  const turn = await briefTurn({ briefId: open?.id || null, text, channel: 'whatsapp', phone });
+  if (!turn.success) { await send([{ text: `⚠️ ${turn.error}` }]); return { handled: true }; }
+  if (turn.offTopic) return { handled: false };
+  if (turn.build && turn.briefId) { await act('build', turn.briefId); return { handled: true }; }
+  if (turn.cancel) { await send([{ text: turn.reply || 'בסדר, עזבתי את הקמפיין הזה.' }], null); return { handled: true }; }
+  const buttons = turn.ready ? [{ id: `mk_build_${turn.briefId}`, title: '✅ כן, לבנות' }, { id: `mk_cancel_${turn.briefId}`, title: '❌ לעזוב' }] : undefined;
+  await send([{ text: turn.reply || '', buttons }], null);
+  return { handled: true };
+}
+
+// ---------- routes ----------
+
+export function registerChatRoutes(app: express.Express) {
+  // the conversation in the app
+  app.post('/api/meta-ads/briefs', async (req, res) => {
+    try {
+      res.json(await briefTurn({ briefId: req.body?.briefId ? Number(req.body.briefId) : null, text: req.body?.text, channel: 'app', baseCampaignId: req.body?.baseCampaignId }));
+    } catch (e: any) {
+      console.error('[brief]', e?.message);
+      res.json({ success: false, error: e?.message || 'שגיאה' });
+    }
+  });
+  app.post('/api/meta-ads/briefs/:id/build', async (req, res) => {
+    try {
+      const brief = await loadBrief(Number(req.params.id));
+      if (!brief) return res.json({ success: false, error: 'השיחה לא נמצאה' });
+      if (!brief.ready) return res.json({ success: false, error: 'יש עוד שאלות פתוחות - ענו עליהן קודם' });
+      res.json(await buildFromBrief(brief.id));
+    } catch (e: any) {
+      res.json({ success: false, error: e?.message || 'שגיאה' });
+    }
+  });
+
+  // who approves on WhatsApp
+  app.get('/api/meta-ads/wa-approval/settings', async (_req, res) => {
+    if (!db()) return res.json({ success: false, error: 'צריך מסד נתונים' });
+    try { res.json({ success: true, ...(await getSettings()) }); } catch (e: any) { res.json({ success: false, error: e?.message }); }
+  });
+  app.put('/api/meta-ads/wa-approval/settings', async (req, res) => {
+    if (!db()) return res.json({ success: false, error: 'צריך מסד נתונים' });
+    try {
+      const approvers: Approver[] = (Array.isArray(req.body?.approvers) ? req.body.approvers : [])
+        .map((a: any) => ({ name: String(a?.name || '').trim().slice(0, 60), phone: intl(a?.phone) }))
+        .filter((a: Approver) => a.phone).slice(0, 10);
+      const template = req.body?.template != null ? String(req.body.template).trim().slice(0, 100) || null : undefined;
+      const p = await ensureChatTables();
+      await p.query(
+        `INSERT INTO mk_wa_settings (tenant_id, approvers, template, updated_by) VALUES ($1, $2::jsonb, $3, $4)
+         ON CONFLICT (tenant_id) DO UPDATE SET approvers = EXCLUDED.approvers, template = COALESCE($3, mk_wa_settings.template), updated_at = now(), updated_by = EXCLUDED.updated_by`,
+        [currentTenant(), JSON.stringify(approvers), template ?? null, who()],
+      );
+      res.json({ success: true, ...(await getSettings()) });
+    } catch (e: any) {
+      res.json({ success: false, error: e?.message });
+    }
+  });
+
+  // a draft built in the app → its summary + "✅ מאשר להעלות" to the approvers on WhatsApp
+  app.post('/api/meta-ads/drafts/:id/send-approval', async (req, res) => {
+    try {
+      const row = await draftRow(Number(req.params.id));
+      if (!row) return res.json({ success: false, error: 'הטיוטה לא נמצאה' });
+      if (row.status !== 'draft') return res.json({ success: false, error: 'הטיוטה כבר הועלתה' });
+      const { approvers } = await getSettings();
+      const to = req.body?.phone ? approvers.filter(a => last9(a.phone) === last9(req.body.phone)) : approvers;
+      if (!to.length) return res.json({ success: false, error: 'אין מאשרים - הוסיפו שם וטלפון' });
+      const draft = cleanDraft(row.draft, row.context);
+      const problems = draftProblems(draft, row.context);
+      if (problems.length) return res.json({ success: false, error: problems.join(' · ') });
+      const msg = draftSummary(Number(row.id), draft, row.context, problems);
+      const results = [];
+      for (const a of to) {
+        const r = await sendToOwner(a.phone, [msg], `קמפיין "${draft.name}" (₪${draft.dailyBudgetIls} ליום) מחכה לאישור`, { kind: 'pub', draftId: Number(row.id) });
+        results.push({ name: a.name, phone: a.phone, ...r });
+      }
+      res.json({ success: results.some(r => r.ok), results });
+    } catch (e: any) {
+      res.json({ success: false, error: e?.message || 'שגיאה' });
+    }
+  });
+}
+
+// BotApp's calls (before the session middleware - their own token says which business)
+function botTenant(req: express.Request): string | null {
+  const secret = process.env.SSO_SHARED_SECRET;
+  if (!secret) return null;
+  try {
+    const c: any = jwt.verify(String(req.headers['x-bot-token'] || ''), secret);
+    return c?.typ === 'marketing-bot' && c.portalTenantId ? String(c.portalTenantId) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function registerBotRoutes(app: express.Express) {
+  app.get('/api/bot/approvers', async (req, res) => {
+    const tenantId = botTenant(req);
+    if (!tenantId) return res.status(401).json({ success: false, error: 'invalid-token' });
+    if (!db()) return res.json({ success: true, phones: [] });
+    await runWithTenant({ tenantId, email: 'נועם', role: 'bot' }, async () => {
+      try { res.json({ success: true, phones: (await getSettings()).approvers.map(a => last9(a.phone)) }); }
+      catch (e: any) { res.json({ success: false, error: e?.message, phones: [] }); }
+    });
+  });
+
+  app.post('/api/bot/owner-message', async (req, res) => {
+    const tenantId = botTenant(req);
+    if (!tenantId) return res.status(401).json({ success: false, error: 'invalid-token' });
+    if (!db()) return res.json({ success: true, handled: false });
+    const phone = intl(req.body?.phone);
+    await runWithTenant({ tenantId, email: 'נועם', role: 'bot' }, async () => {
+      try {
+        const approver = (await getSettings()).approvers.find(a => last9(a.phone) === last9(phone));
+        if (!approver) return res.json({ success: true, handled: false });
+        // the changes are signed by the approver, through נועם
+        await runWithTenant({ tenantId, email: `${approver.name || phone} (וואטסאפ, דרך נועם)`, role: 'owner' }, async () => {
+          const out = await ownerMessage({ phone, text: String(req.body?.text || ''), buttonId: req.body?.buttonId, approver });
+          res.json({ success: true, ...out });
+        });
+      } catch (e: any) {
+        console.error('[owner message]', e?.message);
+        res.json({ success: false, handled: false, error: e?.message });
+      }
+    });
+  });
+}
