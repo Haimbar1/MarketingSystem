@@ -453,6 +453,81 @@ export function registerChatRoutes(app: express.Express) {
     }
   });
 
+  // "📂 שמורות" (Haim, 2026-11-20 - "save a draft here and start from it next time"): everything is
+  // already kept as it goes (the conversation in mk_briefs, the draft in mk_drafts) - this lists what
+  // isn't finished: open conversations, drafts not uploaded, and campaigns uploaded but still paused
+  // (with Meta's status, so "▶️ להפעיל" can be pressed later). Conversations / drafts from WhatsApp too.
+  app.get('/api/meta-ads/saved', async (_req, res) => {
+    if (!db()) return res.json({ success: true, briefs: [], drafts: [], published: [] });
+    try {
+      const p = await ensureChatTables();
+      const t = currentTenant();
+      const briefs = (await p.query(
+        `SELECT id, channel, phone, created_by, updated_at, ready, messages FROM mk_briefs WHERE tenant_id = $1 AND status = 'talking' AND updated_at > now() - interval '60 days' ORDER BY updated_at DESC LIMIT 20`, [t],
+      )).rows.map((b: any) => {
+        const msgs: any[] = Array.isArray(b.messages) ? b.messages : [];
+        return { id: Number(b.id), channel: b.channel, by: b.created_by, updatedAt: b.updated_at, ready: !!b.ready, title: String(msgs.find(m => m.role === 'owner')?.text || '').slice(0, 120), turns: msgs.length };
+      });
+      let drafts: any[] = [];
+      let published: any[] = [];
+      try {
+        drafts = (await p.query(
+          `SELECT id, created_by, created_at, draft FROM mk_drafts WHERE tenant_id = $1 AND status = 'draft' AND created_at > now() - interval '60 days' ORDER BY id DESC LIMIT 20`, [t],
+        )).rows.map((d: any) => ({ id: Number(d.id), by: d.created_by, createdAt: d.created_at, name: d.draft?.name, dailyBudgetIls: d.draft?.dailyBudgetIls }));
+        const pub = (await p.query(
+          `SELECT id, draft, published, published_at FROM mk_drafts WHERE tenant_id = $1 AND status = 'published' AND published_at > now() - interval '30 days' ORDER BY published_at DESC LIMIT 20`, [t],
+        )).rows;
+        const ids = pub.map((r: any) => String(r.published?.campaignId || '')).filter(Boolean);
+        const statuses: Record<string, string> = {};
+        const creds = ids.length ? await adsCredsForCurrentBusiness() : null;
+        if (creds) {
+          const GRAPH = process.env.META_GRAPH_URL || 'https://graph.facebook.com/v21.0';
+          try {
+            const r = await fetch(`${GRAPH}/?ids=${ids.join(',')}&fields=effective_status&access_token=${encodeURIComponent(creds.token)}`, { signal: AbortSignal.timeout(10000) });
+            const d: any = await r.json().catch(() => ({}));
+            for (const id of ids) if (d?.[id]?.effective_status) statuses[id] = d[id].effective_status;
+          } catch { /* shown without a status */ }
+        }
+        published = pub
+          .map((r: any) => ({ draftId: Number(r.id), name: r.draft?.name, dailyBudgetIls: r.draft?.dailyBudgetIls, campaignId: String(r.published?.campaignId || ''), publishedAt: r.published_at, status: statuses[String(r.published?.campaignId || '')] || '' }))
+          .filter((x: any) => x.campaignId && (x.status === 'PAUSED' || x.status === 'CAMPAIGN_PAUSED' || !x.status));
+      } catch { /* no draft table yet */ }
+      res.json({ success: true, briefs, drafts, published });
+    } catch (e: any) {
+      res.json({ success: false, error: e?.message });
+    }
+  });
+  app.get('/api/meta-ads/briefs/:id', async (req, res) => {
+    try {
+      const b = await loadBrief(Number(req.params.id));
+      if (!b) return res.json({ success: false, error: 'השיחה לא נמצאה' });
+      res.json({ success: true, id: b.id, status: b.status, ready: b.ready, messages: b.messages, understood: b.understood, draftId: b.draft_id, baseCampaignId: b.base_campaign_id });
+    } catch (e: any) { res.json({ success: false, error: e?.message }); }
+  });
+  app.get('/api/meta-ads/drafts/:id', async (req, res) => {
+    try {
+      const row = await draftRow(Number(req.params.id));
+      if (!row) return res.json({ success: false, error: 'הטיוטה לא נמצאה' });
+      const draft = cleanDraft(row.draft, row.context);
+      res.json({ success: true, id: Number(row.id), status: row.status, draft, context: row.context, problems: draftProblems(draft, row.context), published: row.published });
+    } catch (e: any) { res.json({ success: false, error: e?.message }); }
+  });
+  // "🗑️" on a saved conversation / draft (nothing in Meta is touched)
+  app.delete('/api/meta-ads/briefs/:id', async (req, res) => {
+    try {
+      const p = await ensureChatTables();
+      await p.query(`UPDATE mk_briefs SET status = 'closed', updated_at = now() WHERE id = $1 AND tenant_id = $2 AND status = 'talking'`, [Number(req.params.id), currentTenant()]);
+      res.json({ success: true });
+    } catch (e: any) { res.json({ success: false, error: e?.message }); }
+  });
+  app.delete('/api/meta-ads/drafts/:id', async (req, res) => {
+    try {
+      const p = await ensureChatTables();
+      await p.query(`UPDATE mk_drafts SET status = 'deleted' WHERE id = $1 AND tenant_id = $2 AND status = 'draft'`, [Number(req.params.id), currentTenant()]);
+      res.json({ success: true });
+    } catch (e: any) { res.json({ success: false, error: e?.message }); }
+  });
+
   // who approves on WhatsApp
   app.get('/api/meta-ads/wa-approval/settings', async (_req, res) => {
     if (!db()) return res.json({ success: false, error: 'צריך מסד נתונים' });

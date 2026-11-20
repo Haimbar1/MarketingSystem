@@ -50,6 +50,8 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
   const [uploadPct, setUploadPct] = useState('');
   const [result, setResult] = useState<any>(null);
   const [activated, setActivated] = useState(false);
+  const [saved, setSaved] = useState<{ briefs: any[]; drafts: any[]; published: any[] } | null>(null);
+  const [notice, setNotice] = useState('');
 
   useEffect(() => {
     fetch('/api/meta-ads/builder/bases').then(r => r.json()).then(d => {
@@ -79,7 +81,39 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
       setReady(!!d.ready);
     } catch (e: any) { setError(e?.message || 'שגיאת רשת'); } finally { setBusy(b => (b === 'talk' ? '' : b)); }
   };
-  const restart = () => { setChat([]); setBriefId(null); setReady(false); setDraft(null); setDraftId(null); setCtx(null); setError(''); };
+  const restart = () => { setChat([]); setBriefId(null); setReady(false); setDraft(null); setDraftId(null); setCtx(null); setResult(null); setActivated(false); setError(''); setWaResult(''); };
+
+  // "📂 שמורות" - everything is kept as it goes; this is what isn't finished (Haim, 2026-11-20)
+  const loadSaved = () => fetch('/api/meta-ads/saved').then(r => r.json()).then(d => { if (d?.success) setSaved(d); }).catch(() => {});
+  useEffect(() => { loadSaved(); }, []);
+  const saveForLater = () => { restart(); setNotice('💾 נשמר. אפשר לחזור לזה מתי שתרצו מ"📂 שמורות" כאן למטה.'); loadSaved(); };
+  const resumeDraft = async (id: number) => {
+    setError(''); setNotice('');
+    const d = await fetch(`/api/meta-ads/drafts/${id}`).then(r => r.json()).catch(() => null);
+    if (!d?.success) { setError(d?.error || 'לא הצלחנו לפתוח את הטיוטה'); return; }
+    setDraftId(d.id); setDraft(d.draft); setCtx(d.context); setProblems(d.problems || []); setUnmatched([]);
+    if (d.status === 'published' && d.published) setResult({ ...d.published, name: d.draft?.name, ads: d.published.ads || [] });
+  };
+  const resumeBrief = async (id: number) => {
+    setError(''); setNotice('');
+    const d = await fetch(`/api/meta-ads/briefs/${id}`).then(r => r.json()).catch(() => null);
+    if (!d?.success) { setError(d?.error || 'לא הצלחנו לפתוח את השיחה'); return; }
+    setBriefId(d.id); setChat((d.messages || []).map((m: any) => ({ role: m.role, text: m.text }))); setReady(!!d.ready);
+    if (d.baseCampaignId) setBaseId(String(d.baseCampaignId));
+    if (d.draftId) await resumeDraft(d.draftId);
+  };
+  const removeSaved = async (kind: 'briefs' | 'drafts', id: number) => {
+    if (!window.confirm(kind === 'briefs' ? 'למחוק את השיחה הזו?' : 'למחוק את הטיוטה הזו? (שום דבר במטא לא משתנה)')) return;
+    await fetch(`/api/meta-ads/${kind}/${id}`, { method: 'DELETE' }).catch(() => {});
+    loadSaved();
+  };
+  const activateSaved = async (p: any) => {
+    if (!window.confirm(`להפעיל עכשיו את הקמפיין "${p.name}"? מרגע זה מטא תתחיל להוציא את התקציב${p.dailyBudgetIls ? ` (₪${p.dailyBudgetIls} ליום)` : ''}.`)) return;
+    setBusy('activate'); setError('');
+    const d = await fetch(`/api/meta-ads/campaigns/${p.campaignId}/manual-change`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'activate_campaign', targetId: p.campaignId, params: {}, title: 'הפעלת קמפיין חדש' }) }).then(r => r.json()).catch(() => ({ success: false, error: 'שגיאת רשת' }));
+    setBusy('');
+    if (d?.success) { setNotice(`▶️ הקמפיין "${p.name}" הופעל.`); loadSaved(); } else setError(d?.error || 'ההפעלה נכשלה');
+  };
 
   const saveApprovers = async (list: { name: string; phone: string }[]) => {
     const d = await fetch('/api/meta-ads/wa-approval/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approvers: list }) }).then(r => r.json()).catch(() => null);
@@ -203,10 +237,35 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
               className="w-full border border-gray-300 rounded-lg p-2" />
             <div className="flex items-center gap-2 text-xs">
               <button onClick={talk} disabled={!instruction.trim() || !baseId || !!busy} className="bg-blue-600 text-white font-bold rounded-lg px-4 py-1.5 disabled:opacity-50">{chat.length ? 'שלח' : 'התחל'}</button>
+              {chat.length > 0 && <button onClick={saveForLater} disabled={!!busy} className={btn}>💾 שמור והמשך אחר כך</button>}
               {chat.length > 0 && <button onClick={restart} disabled={!!busy} className="text-gray-500 underline">להתחיל מחדש</button>}
               <span className="text-gray-400">נועם יסכם מה הבין וישאל מה שלא ברור - שום דבר לא נבנה עד שתאשרו.</span>
             </div>
             {busy === 'draft' && <p className="text-xs text-gray-500 flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> בונה את הטיוטה לפי מה שסיכמנו… (עד דקה)</p>}
+            {notice && <p className="text-xs text-green-800 bg-green-50 rounded-lg p-2">{notice}</p>}
+            {chat.length === 0 && saved && (saved.briefs.length + saved.drafts.length + saved.published.length > 0) && (
+              <div className="space-y-1.5 border-t border-gray-100 pt-3 text-xs">
+                <div className="font-bold text-gray-700">📂 שמורות - להמשיך מאיפה שהפסקתם</div>
+                {saved.published.map(p => (
+                  <div key={`p${p.draftId}`} className="flex flex-wrap items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
+                    <span>⏸️ <b>{p.name}</b> · הועלה למטא ומושהה{p.dailyBudgetIls ? ` · ₪${p.dailyBudgetIls} ליום` : ''}</span>
+                    <button onClick={() => activateSaved(p)} disabled={!!busy} className="bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg px-2 py-1 disabled:opacity-50">▶️ להפעיל</button>
+                  </div>
+                ))}
+                {saved.drafts.map(d => (
+                  <div key={`d${d.id}`} className="flex flex-wrap items-center justify-between gap-2 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1.5">
+                    <span>📝 <b>{d.name}</b> · טיוטה שלא הועלתה{d.dailyBudgetIls ? ` · ₪${d.dailyBudgetIls} ליום` : ''} · {fmtWhen(d.createdAt)}</span>
+                    <span className="flex gap-1"><button onClick={() => resumeDraft(d.id)} className={btn}>פתח</button><button onClick={() => removeSaved('drafts', d.id)} className={btn} title="מחק">🗑️</button></span>
+                  </div>
+                ))}
+                {saved.briefs.map(b => (
+                  <div key={`b${b.id}`} className="flex flex-wrap items-center justify-between gap-2 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1.5">
+                    <span className="min-w-0">💬 {b.channel === 'whatsapp' ? '(וואטסאפ) ' : ''}"{b.title}"{b.ready ? ' · מוכן לבנייה' : ' · באמצע שיחה'} · {fmtWhen(b.updatedAt)}</span>
+                    <span className="flex gap-1"><button onClick={() => resumeBrief(b.id)} className={btn}>המשך</button><button onClick={() => removeSaved('briefs', b.id)} className={btn} title="מחק">🗑️</button></span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
         {error && <p className="text-xs text-red-700 bg-red-50 rounded-lg p-2">{error}</p>}
@@ -328,6 +387,7 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
             <button onClick={publish} disabled={!!busy || problems.length > 0} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl py-2.5 disabled:opacity-50">
               {busy === 'publish' ? 'מעלה למטא…' : '✅ אשר והעלה למטא (מושהה)'}
             </button>
+            <button onClick={saveForLater} disabled={!!busy} className={`${btn} w-full justify-center`}>💾 שמור כטיוטה והמשך אחר כך</button>
           </div>
         )}
 
@@ -355,4 +415,8 @@ export default function NewCampaignBuilder({ onBack }: { onBack: () => void }) {
 // the bot's *bold* (WhatsApp style) as bold
 function richText(t: string) {
   return t.split(/(\*[^*\n]+\*)/g).map((part, i) => (part.length > 2 && part.startsWith('*') && part.endsWith('*') ? <b key={i}>{part.slice(1, -1)}</b> : <React.Fragment key={i}>{part}</React.Fragment>));
+}
+
+function fmtWhen(iso: string) {
+  try { return new Date(iso).toLocaleString('he-IL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
 }
