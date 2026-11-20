@@ -146,6 +146,17 @@ export function applyTexts(spec: any, texts: { bodies: string[]; titles: string[
     const afs = spec.asset_feed_spec;
     // the new texts take the old ones' places, labels included (placement rules point at them)
     const keep = (old: any[] | undefined, list: string[]) => list.map((text, i) => (old?.[i]?.adlabels ? { text, adlabels: old[i].adlabels } : { text }));
+    // with per-placement customisation each rule must get exactly one asset of a kind ("Multiple descriptions
+    // assets can not be applied to rule #1", #100/1885878 - Haim's third try): the ad keeps its exact shape -
+    // the same number of texts in the same places, only their words replaced; never more than it had
+    const inPlace = (old: any[] | undefined, list: string[]) => (old || []).map((o, i) => (list[i] ? { ...o, text: list[i] } : o));
+    if (Array.isArray(afs.asset_customization_rules) && afs.asset_customization_rules.length) {
+      if (bodies.length && afs.bodies?.length) afs.bodies = inPlace(afs.bodies, bodies);
+      if (titles.length && afs.titles?.length) afs.titles = inPlace(afs.titles, titles);
+      if (descs.length && afs.descriptions?.length) afs.descriptions = inPlace(afs.descriptions, descs);
+      fixAssetRules(afs);
+      return spec;
+    }
     if (bodies.length) afs.bodies = keep(afs.bodies, bodies);
     if (titles.length) afs.titles = keep(afs.titles, titles);
     if (descs.length) afs.descriptions = keep(afs.descriptions, descs);
@@ -514,10 +525,17 @@ async function buildAds(draft: Draft, base: Base, media: Media[], token: string,
         spec = { object_story_spec: c.object_story_spec, asset_feed_spec: JSON.parse(JSON.stringify(c.asset_feed_spec)) };
         const imgs = media.filter(m => m.type === 'image') as { type: 'image'; hash: string }[];
         const vids = media.filter(m => m.type === 'video') as { type: 'video'; id: string; thumb: string }[];
+        const afs0 = spec.asset_feed_spec;
+        if (Array.isArray(afs0.asset_customization_rules) && afs0.asset_customization_rules.length) {
+          // per-placement customisation: the new pictures / videos take the old ones' places (labels kept), same count
+          if (imgs.length && afs0.images?.length) afs0.images = afs0.images.map((o: any, k: number) => ({ hash: imgs[k % imgs.length].hash, ...(o.adlabels ? { adlabels: o.adlabels } : {}) }));
+          if (vids.length && afs0.videos?.length) afs0.videos = afs0.videos.map((o: any, k: number) => ({ video_id: vids[k % vids.length].id, thumbnail_url: vids[k % vids.length].thumb, ...(o.adlabels ? { adlabels: o.adlabels } : {}) }));
+        } else {
         if (imgs.length) spec.asset_feed_spec.images = imgs.map(m => ({ hash: m.hash })); else delete spec.asset_feed_spec.images;
         if (vids.length) spec.asset_feed_spec.videos = vids.map(m => ({ video_id: m.id, thumbnail_url: m.thumb })); else delete spec.asset_feed_spec.videos;
         const fmts = [...(imgs.length ? ['SINGLE_IMAGE'] : []), ...(vids.length ? ['SINGLE_VIDEO'] : [])];
         if (Array.isArray(spec.asset_feed_spec.ad_formats)) spec.asset_feed_spec.ad_formats = Array.from(new Set([...spec.asset_feed_spec.ad_formats.filter((f: string) => !/SINGLE_(IMAGE|VIDEO)/.test(f)), ...fmts]));
+        }
         if (c.degrees_of_freedom_spec) spec.degrees_of_freedom_spec = c.degrees_of_freedom_spec;
         if (c.url_tags) spec.url_tags = c.url_tags;
       } else if (c.object_story_spec?.link_data?.child_attachments) {

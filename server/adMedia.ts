@@ -84,6 +84,11 @@ export function creativeWithMedia(c: any, media: Media | null, target: Target = 
     const list: any[] = Array.isArray(afs[key]) ? afs[key] : [];
     const entry = media.type === 'video' ? { video_id: media.id, thumbnail_url: media.thumb } : { hash: media.hash };
     const idOf = (x: any) => String(media.type === 'video' ? x.video_id : x.hash);
+    // per-placement customisation (each placement rule gets exactly one asset of a kind): only a same-kind replace keeps it valid
+    if (Array.isArray(afs.asset_customization_rules) && afs.asset_customization_rules.length) {
+      const sameKind = target.action === 'replace' && target.replaceId && list.some(x => idOf(x) === String(target.replaceId));
+      if (!sameKind) return { error: `במודעה הזו יש התאמה לפי מיקום (תמונה / סרטון אחרים לכל מיקום), ומטא מרשה בה רק החלפה של ${media.type === 'video' ? 'סרטון בסרטון' : 'תמונה בתמונה'} - לא הוספה ולא החלפה בסוג אחר. אפשר ליצור מודעה חדשה במקום.` };
+    }
     if (target.action === 'replace' && target.replaceId) {
       // replacing an asset of the other kind (a picture with a video) = remove it there, add here
       const sameKind = list.findIndex(x => idOf(x) === String(target.replaceId));
