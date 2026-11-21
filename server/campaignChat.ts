@@ -142,7 +142,23 @@ async function viaTemplate(phone: string, template: string, content: string): Pr
 }
 
 // To an approver: a free message inside the 24h window, else the template + the message waits for the reply
-export async function sendToOwner(phone: string, messages: OutMsg[], shortLine: string, prompt?: any): Promise<{ ok: boolean; via?: string; error?: string }> {
+// "📈 מצב הקמפיינים" on every message נועם sends an approver (Haim, 2026-11-21 - "a button to ask what's
+// my campaign's state - also in the other conversations"): a row in a list, else a third / added button
+const STATUS_ROW = { id: 'mk_q_status', title: '📈 מצב הקמפיינים', description: 'מה רץ עכשיו ואיך הולך ב-7 הימים האחרונים' };
+function withStatusButton(messages: OutMsg[]): OutMsg[] {
+  if (!messages.length) return messages;
+  const out = messages.map(m => ({ ...m }));
+  const last = out[out.length - 1];
+  const has = (id: string) => last.list?.rows.some(r => r.id === id) || last.buttons?.some(b => b.id === id);
+  if (has(STATUS_ROW.id)) return out;
+  if (last.list) { if (last.list.rows.length < 10) last.list = { ...last.list, rows: [STATUS_ROW, ...last.list.rows] }; }
+  else if (last.buttons?.length) { if (last.buttons.length < 3) last.buttons = [...last.buttons, { id: STATUS_ROW.id, title: STATUS_ROW.title }]; }
+  else last.buttons = [{ id: STATUS_ROW.id, title: STATUS_ROW.title }, { id: 'mk_menu', title: '📋 עוד שאלות' }];
+  return out;
+}
+
+export async function sendToOwner(phone: string, messagesIn: OutMsg[], shortLine: string, prompt?: any): Promise<{ ok: boolean; via?: string; error?: string }> {
+  const messages = withStatusButton(messagesIn);
   const th = await thread(phone);
   const inWindow = th.last_inbound_at && Date.now() - new Date(th.last_inbound_at).getTime() < WINDOW_MS;
   if (inWindow) {
@@ -358,6 +374,7 @@ const NEW_RE = /חדש|לבנות|תבנה|תבני|ליצור|צור|תכין/;
 const BOT_PREFIX_RE = /^\s*(?:בוט|🤖)[\s:,-]/;
 
 const menuRows = (): ListRow[] => [
+  STATUS_ROW,
   { id: 'mk_q_all_7', title: '📊 7 ימים אחרונים', description: 'כל הקמפיינים: הוצאה, לידים, תורים, רכישות' },
   { id: 'mk_q_all_30', title: '📊 30 ימים אחרונים', description: 'כל הקמפיינים: הוצאה, לידים, תורים, רכישות' },
   { id: 'mk_q_all_60', title: '📊 60 ימים אחרונים', description: 'כל הקמפיינים: הוצאה, לידים, תורים, רכישות' },
@@ -406,12 +423,45 @@ function costsText(title: string, n: Awaited<ReturnType<typeof crmNumbers>>): st
   return [`💰 *${title} - עלות לכל סוג*`, ...n.map(p => `\n*${p.days} ימים* (${dm(p.since)}–${dm(p.until)}) · הוצאה ${ilsF(p.spend)}\n• לליד: ${perF(p.spend, p.leads)} (${nf(p.leads)})\n• לתור: ${perF(p.spend, p.booked)} (${nf(p.booked)})\n• לרוכש: ${perF(p.spend, p.buyers)} (${nf(p.buyers)})`)].join('\n');
 }
 
+// "📈 מצב הקמפיינים": what runs now (Meta's state) and each one's last 7 days from the CRM, plus the campaigns
+// made here that are still paused, plus all campaigns together
+const STATE_HE: Record<string, string> = { ACTIVE: '🟢 פעיל', IN_PROCESS: '⏳ בבדיקה של מטא', WITH_ISSUES: '⚠️ יש בעיה', PAUSED: '⏸️ מושהה', CAMPAIGN_PAUSED: '⏸️ מושהה' };
+async function statusText(): Promise<string> {
+  const b = await listBases();
+  if (!b?.success) return `לא הצלחתי לקרוא את הקמפיינים: ${b?.error || 'שגיאה'}`;
+  const running = b.campaigns.filter((c: any) => ['ACTIVE', 'IN_PROCESS', 'WITH_ISSUES'].includes(c.status)).slice(0, 6);
+  // campaigns made in this system that wait to be turned on
+  let waiting: any[] = [];
+  try {
+    const p = await ensureChatTables();
+    const own = (await p.query(`SELECT object_id FROM mk_changes WHERE tenant_id = $1 AND action = 'create_campaign' AND status = 'done' AND done_at > now() - interval '30 days'`, [currentTenant()])).rows.map((r: any) => String(r.object_id));
+    waiting = b.campaigns.filter((c: any) => own.includes(String(c.id)) && ['PAUSED', 'CAMPAIGN_PAUSED'].includes(c.status));
+  } catch { /* no table yet */ }
+  const [each, all] = await Promise.all([
+    Promise.all(running.map((c: any) => crmNumbers({ id: String(c.id), name: c.name }, [7]).catch(() => null))),
+    crmNumbers(null, [7]).catch(() => null),
+  ]);
+  const lines = [`📈 *מצב הקמפיינים · 7 ימים אחרונים*`];
+  if (!running.length) lines.push('', 'אין כרגע קמפיין שרץ.');
+  running.forEach((c: any, i: number) => {
+    const n = each[i]?.[0];
+    lines.push('', `*${c.name}* · ${STATE_HE[c.status] || c.status}${c.kind && c.kind !== 'other' ? ` · ${KIND_HE[c.kind as Kind]}` : ''}`);
+    if (n) lines.push(`💸 ${ilsF(n.spend)} · 👥 ${nf(n.leads)} לידים (${perF(n.spend, n.leads)} לליד) · 📅 ${nf(n.booked)} תורים (${perF(n.spend, n.booked)} לתור)`);
+    else lines.push('(אין נתונים מה-CRM)');
+  });
+  if (waiting.length) lines.push('', `⏸️ *מחכים להפעלה:* ${waiting.map((c: any) => c.name).join(' · ')}`);
+  const t = all?.[0];
+  if (t) lines.push('', `*כל הקמפיינים יחד:* 💸 ${ilsF(t.spend)} · 👥 ${nf(t.leads)} לידים (${perF(t.spend, t.leads)}) · 📅 ${nf(t.booked)} תורים (${perF(t.spend, t.booked)}) · 🛍️ ${nf(t.buyers)} קנו`);
+  return lines.join('\n');
+}
+
 // what the approver asked, in words → days (7 / 30 / 60)
 const daysOf = (t: string) => (/60|חודשיים/.test(t) ? 60 : /\b7\b|שבוע|השבוע/.test(t) ? 7 : 30);
 
 async function answerQuestion(id: string, send: (m: OutMsg[], prompt?: any) => Promise<any>, phone: string) {
   let m: RegExpExecArray | null;
   if ((m = /^mk_q_all_(7|30|60)$/.exec(id))) return send([withMenu(statsText('כל הקמפיינים', await crmNumbers(null, [Number(m[1])])))]);
+  if (id === 'mk_q_status') return send([withMenu(await statusText())]);
   if (id === 'mk_q_cost') return send([withMenu(costsText('כל הקמפיינים', await crmNumbers(null, [7, 30, 60])))]);
   if (id === 'mk_q_camps') {
     const b = await listBases();
@@ -524,6 +574,8 @@ async function ownerMessage(input: { phone: string; text: string; buttonId?: str
   }
 
   // the conversation before building
+  // "what's the state?" - in any conversation (the open one stays where it was)
+  if (/מה המצב|מצב ה?קמפיינ|איך הולך|איך הקמפיינ/.test(text)) { await answerQuestion('mk_q_status', send, phone); return { handled: true }; }
   const open = await openWaBrief(phone);
   const startNew = fresh(th.prompt) && th.prompt.kind === 'newbrief';
   if (!open && !startNew) {
