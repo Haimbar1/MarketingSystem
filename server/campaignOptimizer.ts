@@ -137,7 +137,7 @@ function creativeKind(c: any) {
 // What the campaign's leads did in the CRM (booked / bought / revenue in ILS, by ad set and ad) -
 // the CRM's POST /api/marketing/campaign-outcomes (server/campaignOutcomes.ts there), same matching
 // as its ROI table. null = no CRM for this business / not reachable (the analysis goes on without it).
-async function crmOutcomes(body: any): Promise<any | null> {
+export async function crmOutcomes(body: any): Promise<any | null> {
   const secret = process.env.SSO_SHARED_SECRET;
   if (!secret) return null;
   try {
@@ -159,8 +159,8 @@ async function crmOutcomes(body: any): Promise<any | null> {
 //  last30 - the last 30 days: purchases still coming in (partial ROAS);
 //  prev30 - 30-60 days ago: matured - the real ROAS.
 // The same days as the dashboard's "7 ימים" / "30 יום" presets.
-const israelToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
-const shiftDay = (day: string, n: number) => new Date(Date.UTC(+day.slice(0, 4), +day.slice(5, 7) - 1, +day.slice(8, 10) + n)).toISOString().slice(0, 10);
+export const israelToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
+export const shiftDay = (day: string, n: number) => new Date(Date.UTC(+day.slice(0, 4), +day.slice(5, 7) - 1, +day.slice(8, 10) + n)).toISOString().slice(0, 10);
 export function outcomePeriods(today = israelToday()) {
   return [
     { key: 'last7', since: shiftDay(today, -6), until: today, label: '7 הימים האחרונים', maturity: 'early' },

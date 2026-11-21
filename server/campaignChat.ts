@@ -26,7 +26,7 @@ import { aiJson } from './ai.js';
 import { currentTenant, currentUser, runWithTenant, OPTICS_TENANT } from './tenant.js';
 import { adsCredsForCurrentBusiness } from './metaAdsSnapshot.js';
 import { listBases, createDraft, publishDraft, readBase, contextOf, cleanDraft, draftProblems, searchPlaces, KIND_HE, type Draft, type Kind } from './campaignBuilder.js';
-import { manualChange, parseJson } from './campaignOptimizer.js';
+import { manualChange, parseJson, crmOutcomes, israelToday, shiftDay } from './campaignOptimizer.js';
 
 const BOTAPP_URL = (process.env.BOTAPP_URL || 'https://app.smartesek.com').replace(/\/$/, '');
 const WA_URL = (process.env.WHATSAPP_URL || 'https://whatsapp.smartesek.com').replace(/\/$/, '');
@@ -43,7 +43,8 @@ const intl = (p: unknown) => { const n = last9(p); return n.length === 9 ? `972$
 const who = () => currentUser()?.email || 'unknown';
 
 type Button = { id: string; title: string };
-type OutMsg = { text: string; buttons?: Button[] };
+type ListRow = { id: string; title: string; description?: string };
+type OutMsg = { text: string; buttons?: Button[]; list?: { button: string; rows: ListRow[] } };
 type Approver = { name: string; phone: string };
 
 let tablesReady = false;
@@ -347,6 +348,103 @@ async function draftRow(id: number) {
 
 // ---------- the owner's WhatsApp message ----------
 
+// ---------- the approvers' questions on WhatsApp (Haim, 2026-11-21) ----------
+// "When an approved number asks something, give it options (the question + an emoji): the campaigns' data -
+// all campaigns by default, or one of them - for the last 7, 30, 60 days: spend, leads, booked exams,
+// purchases, the cost of each." The numbers are the CRM dashboard's ROI table for those days (the CRM's
+// campaign-outcomes: `total` = every campaign with spend + every Meta lead; one campaign = its own row).
+const STATS_RE = /נתונ|דוח|דו"ח|סטטיסטיק|ביצוע|תוצא|כמה (?:לידים|תורים|רכישות|עלה|עולה|הוצא)|עלות ל|הוצאה|לידים|רכישות|תורים|החזר|roas/i;
+const NEW_RE = /חדש|לבנות|תבנה|תבני|ליצור|צור|תכין/;
+const BOT_PREFIX_RE = /^\s*(?:בוט|🤖)[\s:,-]/;
+
+const menuRows = (): ListRow[] => [
+  { id: 'mk_q_all_7', title: '📊 7 ימים אחרונים', description: 'כל הקמפיינים: הוצאה, לידים, תורים, רכישות' },
+  { id: 'mk_q_all_30', title: '📊 30 ימים אחרונים', description: 'כל הקמפיינים: הוצאה, לידים, תורים, רכישות' },
+  { id: 'mk_q_all_60', title: '📊 60 ימים אחרונים', description: 'כל הקמפיינים: הוצאה, לידים, תורים, רכישות' },
+  { id: 'mk_q_cost', title: '💰 עלות לליד/תור/רוכש', description: '7 / 30 / 60 ימים זה מול זה' },
+  { id: 'mk_q_camps', title: '📣 לפי קמפיין', description: 'לבחור קמפיין ולראות את הנתונים שלו' },
+  { id: 'mk_q_new', title: '✨ קמפיין חדש', description: 'לבנות קמפיין בשיחה עם נועם' },
+  { id: 'mk_q_saved', title: '📂 טיוטות ומושהים', description: 'מה מחכה לאישור או להפעלה' },
+];
+const withMenu = (text: string): OutMsg => ({ text, list: { button: '📋 מה עוד לבדוק?', rows: menuRows() } });
+
+const nf = (n: number) => Math.round(n).toLocaleString('he-IL');
+const ilsF = (n: number | null | undefined) => (n == null || !isFinite(n) ? '—' : `₪${nf(n)}`);
+const perF = (spend: number | null | undefined, n: number) => (spend != null && n > 0 ? ilsF(spend / n) : '—');
+const dm = (d: string) => `${d.slice(8, 10)}.${d.slice(5, 7)}`;
+const periodOf = (days: number) => { const until = israelToday(); return { key: `d${days}`, since: shiftDay(until, -(days - 1)), until }; };
+
+// one call to the CRM for the asked periods; campaign = null → the bottom line of every campaign
+async function crmNumbers(campaign: { id: string; name: string } | null, days: number[]) {
+  const periods = days.map(periodOf);
+  const r = await crmOutcomes({ campaignId: campaign?.id || '0', campaignName: campaign?.name || '', adsets: [], ads: [], periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })) });
+  if (!r?.periods) return null;
+  return periods.map(p => {
+    const x: any = r.periods.find((y: any) => y.key === p.key) || {};
+    const t = campaign ? { spendIls: x.spendIls, leads: x.leads || 0, booked: x.booked || 0, buyers: x.buyers || 0, revenue: x.revenue || 0, fbLeads: x.fbLeads } : (x.total || {});
+    return { ...p, days: Number(p.key.slice(1)), spend: t.spendIls ?? null, leads: Number(t.leads) || 0, booked: Number(t.booked) || 0, buyers: Number(t.buyers) || 0, revenue: Number(t.revenue) || 0, fbLeads: t.fbLeads, accountSpend: x.total?.spendIls ?? null };
+  });
+}
+
+function statsText(title: string, n: Awaited<ReturnType<typeof crmNumbers>>): string {
+  if (!n) return 'לא הצלחתי לקרוא כרגע את הנתונים מה-CRM. נסו שוב בעוד דקה.';
+  const p = n[0];
+  const roas = p.spend ? p.revenue / p.spend : null;
+  const ripe = p.days <= 7 ? ' (מוקדם לדעת - הלידים עוד לא הספיקו לקנות)' : p.days <= 30 ? ' (עוד מבשיל - רכישות עוד מגיעות)' : '';
+  return [
+    `📊 *${title} · ${p.days} ימים אחרונים* (${dm(p.since)}–${dm(p.until)})`,
+    `• 💸 הוצאה: *${ilsF(p.spend)}*`,
+    `• 👥 לידים: *${nf(p.leads)}* · ${perF(p.spend, p.leads)} לליד`,
+    `• 📅 קבעו תור: *${nf(p.booked)}* · ${perF(p.spend, p.booked)} לתור`,
+    `• 🛍️ קנו: *${nf(p.buyers)}* · ${perF(p.spend, p.buyers)} לרוכש`,
+    `• 💰 הכנסה: ${ilsF(p.revenue)}${roas != null ? ` · החזר ${roas.toFixed(1)}x` : ''}${ripe}`,
+  ].join('\n');
+}
+
+function costsText(title: string, n: Awaited<ReturnType<typeof crmNumbers>>): string {
+  if (!n) return 'לא הצלחתי לקרוא כרגע את הנתונים מה-CRM. נסו שוב בעוד דקה.';
+  return [`💰 *${title} - עלות לכל סוג*`, ...n.map(p => `\n*${p.days} ימים* (${dm(p.since)}–${dm(p.until)}) · הוצאה ${ilsF(p.spend)}\n• לליד: ${perF(p.spend, p.leads)} (${nf(p.leads)})\n• לתור: ${perF(p.spend, p.booked)} (${nf(p.booked)})\n• לרוכש: ${perF(p.spend, p.buyers)} (${nf(p.buyers)})`)].join('\n');
+}
+
+// what the approver asked, in words → days (7 / 30 / 60)
+const daysOf = (t: string) => (/60|חודשיים/.test(t) ? 60 : /\b7\b|שבוע|השבוע/.test(t) ? 7 : 30);
+
+async function answerQuestion(id: string, send: (m: OutMsg[], prompt?: any) => Promise<any>, phone: string) {
+  let m: RegExpExecArray | null;
+  if ((m = /^mk_q_all_(7|30|60)$/.exec(id))) return send([withMenu(statsText('כל הקמפיינים', await crmNumbers(null, [Number(m[1])])))]);
+  if (id === 'mk_q_cost') return send([withMenu(costsText('כל הקמפיינים', await crmNumbers(null, [7, 30, 60])))]);
+  if (id === 'mk_q_camps') {
+    const b = await listBases();
+    if (!b?.success || !b.campaigns.length) return send([withMenu('לא מצאתי קמפיינים בחשבון המודעות.')]);
+    const active = b.campaigns.filter((c: any) => c.status === 'ACTIVE');
+    const rows = (active.length ? active : b.campaigns).slice(0, 9).map((c: any) => ({ id: `mk_q_c_${c.id}`, title: String(c.name).slice(0, 24), description: `${KIND_HE[c.kind as Kind] || ''} · ${c.leads30} לידים ב-30 יום`.slice(0, 72) }));
+    return send([{ text: `📣 על איזה קמפיין? (${active.length ? 'הפעילים' : 'האחרונים'})`, list: { button: 'לבחור קמפיין', rows: [...rows, { id: 'mk_menu', title: '↩️ חזרה לתפריט' }] } }]);
+  }
+  if ((m = /^mk_q_c_(\d+)$/.exec(id))) {
+    return send([{ text: 'לאיזו תקופה?', buttons: [{ id: `mk_q_c_${m[1]}_7`, title: '7 ימים' }, { id: `mk_q_c_${m[1]}_30`, title: '30 ימים' }, { id: `mk_q_c_${m[1]}_60`, title: '60 ימים' }] }]);
+  }
+  if ((m = /^mk_q_c_(\d+)_(7|30|60)$/.exec(id))) {
+    const b = await listBases();
+    const c = (b?.campaigns || []).find((x: any) => String(x.id) === m![1]);
+    const n = await crmNumbers({ id: m[1], name: c?.name || '' }, [Number(m[2])]);
+    const extra = n?.[0]?.accountSpend != null && n[0].spend != null && n[0].accountSpend !== n[0].spend ? `\n_(כל הקמפיינים יחד באותם ימים: הוצאה ${ilsF(n[0].accountSpend)})_` : '';
+    return send([withMenu(statsText(c?.name || 'הקמפיין', n) + extra + '\n_הלידים משויכים לקמפיין לפי השם שלו ב-CRM - כמו בטבלה בדשבורד._')]);
+  }
+  if (id === 'mk_q_new') return send([{ text: '✨ ספרו לי על הקמפיין: איפה, כמה ליום, למי, ומה להדגיש. אסכם מה הבנתי ואשאל מה שלא ברור - שום דבר לא נבנה בלי האישור שלכם.' }], { kind: 'newbrief' });
+  if (id === 'mk_q_saved') {
+    const p = await ensureChatTables();
+    const t = currentTenant();
+    const drafts = (await p.query(`SELECT draft FROM mk_drafts WHERE tenant_id = $1 AND status = 'draft' AND created_at > now() - interval '60 days' ORDER BY id DESC LIMIT 5`, [t]).catch(() => ({ rows: [] as any[] }))).rows;
+    const pub = (await p.query(`SELECT draft FROM mk_drafts WHERE tenant_id = $1 AND status = 'published' AND published_at > now() - interval '30 days' ORDER BY published_at DESC LIMIT 5`, [t]).catch(() => ({ rows: [] as any[] }))).rows;
+    const lines = [
+      ...drafts.map((r: any) => `📝 ${r.draft?.name} · טיוטה · ₪${r.draft?.dailyBudgetIls} ליום`),
+      ...pub.map((r: any) => `⬆️ ${r.draft?.name} · הועלה למטא`),
+    ];
+    return send([withMenu(lines.length ? `📂 *מה מחכה:*\n${lines.join('\n')}\n\nאת הטיוטות פותחים במערכת השיווק ← "✨ קמפיין חדש מהוראה" ← "📂 שמורות".` : '📂 אין כרגע טיוטות או קמפיינים שמחכים.')]);
+  }
+  return send([withMenu('מה תרצו לדעת?')]);
+}
+
 // Every answer is pushed through BotApp (notify), so a slow step (building / uploading) still reaches
 // the owner when BotApp stopped waiting. The return value only says whether the message was ours.
 async function ownerMessage(input: { phone: string; text: string; buttonId?: string; approver: Approver }): Promise<{ handled: boolean }> {
@@ -354,7 +452,11 @@ async function ownerMessage(input: { phone: string; text: string; buttonId?: str
   const text = String(input.text || '').trim();
   const send = (msgs: OutMsg[], prompt?: any) => sendToOwner(phone, msgs, 'הודעה מנועם על הקמפיין', prompt);
   await noteInbound(phone);
+  // "בוט: …" / "🤖 …" from an approver = talk to the regular bot (testing it from the owner's phone)
+  if (!input.buttonId && BOT_PREFIX_RE.test(text)) return { handled: false };
   const th = await thread(phone);
+  const qid = String(input.buttonId || '');
+  if (/^mk_(q_|menu$)/.test(qid)) { await answerQuestion(qid, send, phone); return { handled: true }; }
   const btn = /^mk_(pub|no|act|later|build|cancel)_(\d+)$/.exec(String(input.buttonId || ''));
 
   // a message that was waiting for the 24h window (a template went out) - shown now
@@ -418,15 +520,30 @@ async function ownerMessage(input: { phone: string; text: string; buttonId?: str
     }
     if (c.intent === 'new') await setPrompt(phone, null);
     else if (c.intent !== 'other') { await send([{ text: 'לא הבנתי - אפשר ללחוץ על אחד הכפתורים, או לכתוב מה לשנות.' }]); return { handled: true }; }
-    else return { handled: false }; // not about the campaign: the bot answers it as usual
+    // not about the campaign: questions / the menu (below)
   }
 
   // the conversation before building
   const open = await openWaBrief(phone);
-  if (!open && !MARKETING_RE.test(text)) return { handled: false };
+  const startNew = fresh(th.prompt) && th.prompt.kind === 'newbrief';
+  if (!open && !startNew) {
+    // a question about the numbers → answered at once (all campaigns), with the menu; a new campaign → the
+    // conversation; anything else → the menu of questions
+    if (STATS_RE.test(text) && !NEW_RE.test(text)) {
+      const days = daysOf(text);
+      const cost = /עלות ל|כמה עול|כמה עלה/.test(text) && !/הוצאה/.test(text);
+      await answerQuestion(cost ? 'mk_q_cost' : `mk_q_all_${days}`, send, phone);
+      return { handled: true };
+    }
+    if (!MARKETING_RE.test(text)) {
+      await send([withMenu(`שלום${input.approver.name ? ` ${input.approver.name}` : ''}! 👋 אני נועם. מה תרצו לדעת על הקמפיינים?\n\n_(כדי לדבר עם הבוט הרגיל של העסק - להתחיל את ההודעה ב"בוט:")_`)]);
+      return { handled: true };
+    }
+  }
+  if (startNew) await setPrompt(phone, null);
   const turn = await briefTurn({ briefId: open?.id || null, text, channel: 'whatsapp', phone });
   if (!turn.success) { await send([{ text: `⚠️ ${turn.error}` }]); return { handled: true }; }
-  if (turn.offTopic) return { handled: false };
+  if (turn.offTopic) { await send([withMenu('מה תרצו לדעת?')]); return { handled: true }; }
   if (turn.build && turn.briefId) { await act('build', turn.briefId); return { handled: true }; }
   if (turn.cancel) { await send([{ text: turn.reply || 'בסדר, עזבתי את הקמפיין הזה.' }], null); return { handled: true }; }
   const buttons = turn.ready ? [{ id: `mk_build_${turn.briefId}`, title: '✅ כן, לבנות' }, { id: `mk_cancel_${turn.briefId}`, title: '❌ לעזוב' }] : undefined;
