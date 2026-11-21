@@ -61,6 +61,8 @@ async function ensureChatTables() {
   await p.query(`CREATE TABLE IF NOT EXISTS mk_wa_threads (
     tenant_id TEXT NOT NULL, phone9 TEXT NOT NULL, last_inbound_at TIMESTAMPTZ, prompt JSONB, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, phone9))`);
+  await p.query(`CREATE TABLE IF NOT EXISTS mk_stats_cache (
+    tenant_id TEXT NOT NULL, key TEXT NOT NULL, data JSONB NOT NULL, computed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, key))`);
   tablesReady = true;
   return p;
 }
@@ -383,7 +385,10 @@ const menuRows = (): ListRow[] => [
   { id: 'mk_q_new', title: '✨ קמפיין חדש', description: 'לבנות קמפיין בשיחה עם נועם' },
   { id: 'mk_q_saved', title: '📂 טיוטות ומושהים', description: 'מה מחכה לאישור או להפעלה' },
 ];
-const withMenu = (text: string): OutMsg => ({ text, list: { button: '📋 מה עוד לבדוק?', rows: menuRows() } });
+const withMenu = (text: string, refreshId?: string): OutMsg => ({
+  text,
+  list: { button: '📋 מה עוד לבדוק?', rows: [...(refreshId ? [{ id: refreshId, title: '🔄 לרענן עכשיו', description: 'לחשב מחדש מה-CRM (עד חצי דקה)' }] : []), ...menuRows()].slice(0, 10) },
+});
 
 const nf = (n: number) => Math.round(n).toLocaleString('he-IL');
 const ilsF = (n: number | null | undefined) => (n == null || !isFinite(n) ? '—' : `₪${nf(n)}`);
@@ -391,12 +396,18 @@ const perF = (spend: number | null | undefined, n: number) => (spend != null && 
 const dm = (d: string) => `${d.slice(8, 10)}.${d.slice(5, 7)}`;
 const periodOf = (days: number) => { const until = israelToday(); return { key: `d${days}`, since: shiftDay(until, -(days - 1)), until }; };
 
-// one call to the CRM for the asked periods; campaign = null → the bottom line of every campaign
-async function crmNumbers(campaign: { id: string; name: string } | null, days: number[]) {
-  const periods = days.map(periodOf);
+// One CRM call for 7 / 30 / 60 days at once (campaign = null → every campaign's bottom line). It can take a
+// while (the CRM reads each period's spend from Meta) - Haim, 2026-11-21: "maybe it times out; prepare the
+// results every day in a cache": answers come from `mk_stats_cache` (made every morning by the cron
+// `/api/cron/warm-stats`, and after every live read), "🔄 לרענן עכשיו" reads live (up to 45s).
+type Num = { key: string; since: string; until: string; days: number; spend: number | null; leads: number; booked: number; buyers: number; revenue: number; fbLeads?: number; accountSpend: number | null };
+type Nums = Num[] & { at?: string };
+const ALL_DAYS = [7, 30, 60];
+async function crmLive(campaign: { id: string; name: string } | null): Promise<Num[] | null> {
+  const periods = ALL_DAYS.map(periodOf);
   // the CRM requires a campaign id + name (its own row); for "all campaigns" only its bottom line (`total`) is read,
   // which doesn't depend on them - a placeholder (an empty name was refused with 400 → "couldn't read the CRM")
-  const r = await crmOutcomes({ campaignId: campaign?.id || '0', campaignName: campaign?.name || campaign?.id || 'כל הקמפיינים', adsets: [], ads: [], periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })) });
+  const r = await crmOutcomes({ campaignId: campaign?.id || '0', campaignName: campaign?.name || campaign?.id || 'כל הקמפיינים', adsets: [], ads: [], periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })) }, 45000);
   if (!r?.periods) return null;
   return periods.map(p => {
     const x: any = r.periods.find((y: any) => y.key === p.key) || {};
@@ -404,8 +415,36 @@ async function crmNumbers(campaign: { id: string; name: string } | null, days: n
     return { ...p, days: Number(p.key.slice(1)), spend: t.spendIls ?? null, leads: Number(t.leads) || 0, booked: Number(t.booked) || 0, buyers: Number(t.buyers) || 0, revenue: Number(t.revenue) || 0, fbLeads: t.fbLeads, accountSpend: x.total?.spendIls ?? null };
   });
 }
+const cacheKey = (campaign: { id: string } | null) => `crm:${campaign?.id || 'all'}`;
+async function cached(campaign: { id: string } | null): Promise<{ n: Num[]; at: string } | null> {
+  const p = await ensureChatTables();
+  const r = await p.query(`SELECT data, computed_at FROM mk_stats_cache WHERE tenant_id = $1 AND key = $2`, [currentTenant(), cacheKey(campaign)]);
+  const row = r.rows[0];
+  // only today's (Israel) numbers - the periods end today
+  if (!row || row.data?.day !== israelToday()) return null;
+  return { n: row.data.n, at: new Date(row.computed_at).toISOString() };
+}
+async function refresh(campaign: { id: string; name: string } | null): Promise<{ n: Num[]; at: string } | null> {
+  const n = await crmLive(campaign);
+  if (!n) return null;
+  const p = await ensureChatTables();
+  await p.query(
+    `INSERT INTO mk_stats_cache (tenant_id, key, data, computed_at) VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (tenant_id, key) DO UPDATE SET data = EXCLUDED.data, computed_at = now()`,
+    [currentTenant(), cacheKey(campaign), JSON.stringify({ day: israelToday(), n })],
+  );
+  return { n, at: new Date().toISOString() };
+}
+// the asked days of a campaign / all campaigns: from the cache unless `force`; `wait` says "⏳" before a live read
+async function crmNumbers(campaign: { id: string; name: string } | null, days: number[], opts: { force?: boolean; wait?: () => Promise<unknown> } = {}): Promise<Nums | null> {
+  let got = opts.force ? null : await cached(campaign).catch(() => null);
+  if (!got) { await opts.wait?.(); got = await refresh(campaign).catch(() => null); }
+  if (!got) return null;
+  return Object.assign(got.n.filter(x => days.includes(x.days)), { at: got.at });
+}
+const asOf = (n: Nums | null) => (n?.at ? `\n_נכון ל-${new Date(n.at).toLocaleTimeString('he-IL', { timeZone: 'Asia/Jerusalem', hour: '2-digit', minute: '2-digit' })}_` : '');
 
-function statsText(title: string, n: Awaited<ReturnType<typeof crmNumbers>>): string {
+function statsText(title: string, n: Nums | null): string {
   if (!n) return 'לא הצלחתי לקרוא כרגע את הנתונים מה-CRM. נסו שוב בעוד דקה.';
   const p = n[0];
   const roas = p.spend ? p.revenue / p.spend : null;
@@ -417,18 +456,18 @@ function statsText(title: string, n: Awaited<ReturnType<typeof crmNumbers>>): st
     `• 📅 קבעו תור: *${nf(p.booked)}* · ${perF(p.spend, p.booked)} לתור`,
     `• 🛍️ קנו: *${nf(p.buyers)}* · ${perF(p.spend, p.buyers)} לרוכש`,
     `• 💰 הכנסה: ${ilsF(p.revenue)}${roas != null ? ` · החזר ${roas.toFixed(1)}x` : ''}${ripe}`,
-  ].join('\n');
+  ].join('\n') + asOf(n);
 }
 
-function costsText(title: string, n: Awaited<ReturnType<typeof crmNumbers>>): string {
+function costsText(title: string, n: Nums | null): string {
   if (!n) return 'לא הצלחתי לקרוא כרגע את הנתונים מה-CRM. נסו שוב בעוד דקה.';
-  return [`💰 *${title} - עלות לכל סוג*`, ...n.map(p => `\n*${p.days} ימים* (${dm(p.since)}–${dm(p.until)}) · הוצאה ${ilsF(p.spend)}\n• לליד: ${perF(p.spend, p.leads)} (${nf(p.leads)})\n• לתור: ${perF(p.spend, p.booked)} (${nf(p.booked)})\n• לרוכש: ${perF(p.spend, p.buyers)} (${nf(p.buyers)})`)].join('\n');
+  return [`💰 *${title} - עלות לכל סוג*`, ...n.map(p => `\n*${p.days} ימים* (${dm(p.since)}–${dm(p.until)}) · הוצאה ${ilsF(p.spend)}\n• לליד: ${perF(p.spend, p.leads)} (${nf(p.leads)})\n• לתור: ${perF(p.spend, p.booked)} (${nf(p.booked)})\n• לרוכש: ${perF(p.spend, p.buyers)} (${nf(p.buyers)})`)].join('\n') + asOf(n);
 }
 
 // "📈 מצב הקמפיינים": what runs now (Meta's state) and each one's last 7 days from the CRM, plus the campaigns
 // made here that are still paused, plus all campaigns together
 const STATE_HE: Record<string, string> = { ACTIVE: '🟢 פעיל', IN_PROCESS: '⏳ בבדיקה של מטא', WITH_ISSUES: '⚠️ יש בעיה', PAUSED: '⏸️ מושהה', CAMPAIGN_PAUSED: '⏸️ מושהה' };
-async function statusText(): Promise<string> {
+async function statusText(opts: { force?: boolean; wait?: () => Promise<unknown> } = {}): Promise<string> {
   const b = await listBases();
   if (!b?.success) return `לא הצלחתי לקרוא את הקמפיינים: ${b?.error || 'שגיאה'}`;
   const running = b.campaigns.filter((c: any) => ['ACTIVE', 'IN_PROCESS', 'WITH_ISSUES'].includes(c.status)).slice(0, 6);
@@ -439,9 +478,12 @@ async function statusText(): Promise<string> {
     const own = (await p.query(`SELECT object_id FROM mk_changes WHERE tenant_id = $1 AND action = 'create_campaign' AND status = 'done' AND done_at > now() - interval '30 days'`, [currentTenant()])).rows.map((r: any) => String(r.object_id));
     waiting = b.campaigns.filter((c: any) => own.includes(String(c.id)) && ['PAUSED', 'CAMPAIGN_PAUSED'].includes(c.status));
   } catch { /* no table yet */ }
+  // one "⏳" for all of them when anything has to be read live
+  let waited = false;
+  const wait = async () => { if (!waited) { waited = true; await opts.wait?.(); } };
   const [each, all] = await Promise.all([
-    Promise.all(running.map((c: any) => crmNumbers({ id: String(c.id), name: c.name }, [7]).catch(() => null))),
-    crmNumbers(null, [7]).catch(() => null),
+    Promise.all(running.map((c: any) => crmNumbers({ id: String(c.id), name: c.name }, [7], { force: opts.force, wait }).catch(() => null))),
+    crmNumbers(null, [7], { force: opts.force, wait }).catch(() => null),
   ]);
   const lines = [`📈 *מצב הקמפיינים · 7 ימים אחרונים*`];
   if (!running.length) lines.push('', 'אין כרגע קמפיין שרץ.');
@@ -454,17 +496,23 @@ async function statusText(): Promise<string> {
   if (waiting.length) lines.push('', `⏸️ *מחכים להפעלה:* ${waiting.map((c: any) => c.name).join(' · ')}`);
   const t = all?.[0];
   if (t) lines.push('', `*כל הקמפיינים יחד:* 💸 ${ilsF(t.spend)} · 👥 ${nf(t.leads)} לידים (${perF(t.spend, t.leads)}) · 📅 ${nf(t.booked)} תורים (${perF(t.spend, t.booked)}) · 🛍️ ${nf(t.buyers)} קנו`);
-  return lines.join('\n');
+  else lines.push('', 'לא הצלחתי לקרוא כרגע את הנתונים מה-CRM - אפשר ללחוץ "🔄 לרענן עכשיו" בעוד דקה.');
+  return lines.join('\n') + asOf(all);
 }
 
 // what the approver asked, in words → days (7 / 30 / 60)
 const daysOf = (t: string) => (/60|חודשיים/.test(t) ? 60 : /\b7\b|שבוע|השבוע/.test(t) ? 7 : 30);
 
-async function answerQuestion(id: string, send: (m: OutMsg[], prompt?: any) => Promise<any>, phone: string) {
+async function answerQuestion(idIn: string, send: (m: OutMsg[], prompt?: any) => Promise<any>, phone: string) {
   let m: RegExpExecArray | null;
-  if ((m = /^mk_q_all_(7|30|60)$/.exec(id))) return send([withMenu(statsText('כל הקמפיינים', await crmNumbers(null, [Number(m[1])])))]);
-  if (id === 'mk_q_status') return send([withMenu(await statusText())]);
-  if (id === 'mk_q_cost') return send([withMenu(costsText('כל הקמפיינים', await crmNumbers(null, [7, 30, 60])))]);
+  // "🔄 לרענן עכשיו" = the same question read live from the CRM
+  const force = idIn.startsWith('mk_q_r_');
+  const id = force ? `mk_q_${idIn.slice('mk_q_r_'.length)}` : idIn;
+  const refreshId = `mk_q_r_${id.slice('mk_q_'.length)}`;
+  const opts = { force, wait: () => viaBotApp(phone, [{ text: '⏳ אוסף את הנתונים מה-CRM... רגע' }]) };
+  if ((m = /^mk_q_all_(7|30|60)$/.exec(id))) return send([withMenu(statsText('כל הקמפיינים', await crmNumbers(null, [Number(m[1])], opts)), refreshId)]);
+  if (id === 'mk_q_status') return send([withMenu(await statusText(opts), refreshId)]);
+  if (id === 'mk_q_cost') return send([withMenu(costsText('כל הקמפיינים', await crmNumbers(null, [7, 30, 60], opts)), refreshId)]);
   if (id === 'mk_q_camps') {
     const b = await listBases();
     if (!b?.success || !b.campaigns.length) return send([withMenu('לא מצאתי קמפיינים בחשבון המודעות.')]);
@@ -478,9 +526,9 @@ async function answerQuestion(id: string, send: (m: OutMsg[], prompt?: any) => P
   if ((m = /^mk_q_c_(\d+)_(7|30|60)$/.exec(id))) {
     const b = await listBases();
     const c = (b?.campaigns || []).find((x: any) => String(x.id) === m![1]);
-    const n = await crmNumbers({ id: m[1], name: c?.name || '' }, [Number(m[2])]);
+    const n = await crmNumbers({ id: m[1], name: c?.name || '' }, [Number(m[2])], opts);
     const extra = n?.[0]?.accountSpend != null && n[0].spend != null && n[0].accountSpend !== n[0].spend ? `\n_(כל הקמפיינים יחד באותם ימים: הוצאה ${ilsF(n[0].accountSpend)})_` : '';
-    return send([withMenu(statsText(c?.name || 'הקמפיין', n) + extra + '\n_הלידים משויכים לקמפיין לפי השם שלו ב-CRM - כמו בטבלה בדשבורד._')]);
+    return send([withMenu(statsText(c?.name || 'הקמפיין', n) + extra + '\n_הלידים משויכים לקמפיין לפי השם שלו ב-CRM - כמו בטבלה בדשבורד._', refreshId)]);
   }
   if (id === 'mk_q_new') return send([{ text: '✨ ספרו לי על הקמפיין: איפה, כמה ליום, למי, ומה להדגיש. אסכם מה הבנתי ואשאל מה שלא ברור - שום דבר לא נבנה בלי האישור שלכם.' }], { kind: 'newbrief' });
   if (id === 'mk_q_saved') {
@@ -770,7 +818,32 @@ function botTenant(req: express.Request): string | null {
   }
 }
 
+// Every morning (vercel.json cron): the numbers נועם answers with, ready in the cache for every business that
+// has approvers - all campaigns + each running one, 7 / 30 / 60 days (Haim, 2026-11-21)
+export async function warmStats(): Promise<any[]> {
+  if (!db()) return [];
+  const p = await ensureChatTables();
+  const tenants = (await p.query(`SELECT tenant_id FROM mk_wa_settings WHERE jsonb_array_length(approvers) > 0`)).rows.map((r: any) => String(r.tenant_id));
+  const out: any[] = [];
+  await Promise.all(tenants.map(tenantId => runWithTenant({ tenantId, email: 'מערכת (הכנת נתונים)', role: 'system' }, async () => {
+    try {
+      const b = await listBases();
+      const running = (b?.campaigns || []).filter((c: any) => ['ACTIVE', 'IN_PROCESS', 'WITH_ISSUES'].includes(c.status)).slice(0, 6);
+      const res = await Promise.all([refresh(null), ...running.map((c: any) => refresh({ id: String(c.id), name: c.name }))].map(x => x.catch(() => null)));
+      out.push({ tenantId, campaigns: running.length, ok: res.filter(Boolean).length, of: res.length });
+    } catch (e: any) { out.push({ tenantId, error: e?.message }); }
+  })));
+  return out;
+}
+
 export function registerBotRoutes(app: express.Express) {
+  // Vercel's cron (with CRON_SECRET set, only it may call)
+  app.get('/api/cron/warm-stats', async (req, res) => {
+    const secret = process.env.CRON_SECRET;
+    if (secret ? req.headers.authorization !== `Bearer ${secret}` : !String(req.headers['user-agent'] || '').includes('vercel-cron')) return res.status(401).json({ success: false });
+    try { res.json({ success: true, results: await warmStats() }); } catch (e: any) { res.json({ success: false, error: e?.message }); }
+  });
+
   app.get('/api/bot/approvers', async (req, res) => {
     const tenantId = botTenant(req);
     if (!tenantId) return res.status(401).json({ success: false, error: 'invalid-token' });

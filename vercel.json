@@ -3,6 +3,9 @@
   "functions": {
     "api/index.ts": { "maxDuration": 60 }
   },
+  "crons": [
+    { "path": "/api/cron/warm-stats", "schedule": "30 3 * * *" }
+  ],
   "rewrites": [
     { "source": "/api/:path*", "destination": "/api/index" }
   ]

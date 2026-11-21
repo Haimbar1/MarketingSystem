@@ -137,14 +137,14 @@ function creativeKind(c: any) {
 // What the campaign's leads did in the CRM (booked / bought / revenue in ILS, by ad set and ad) -
 // the CRM's POST /api/marketing/campaign-outcomes (server/campaignOutcomes.ts there), same matching
 // as its ROI table. null = no CRM for this business / not reachable (the analysis goes on without it).
-export async function crmOutcomes(body: any): Promise<any | null> {
+export async function crmOutcomes(body: any, timeoutMs = 15000): Promise<any | null> {
   const secret = process.env.SSO_SHARED_SECRET;
   if (!secret) return null;
   try {
     const token = jwt.sign({ typ: 'marketing-outcomes', portalTenantId: Number(currentTenant()) }, secret, { expiresIn: '2m' });
     const r = await fetch(`${process.env.CRM_URL || 'https://crm.smartesek.com'}/api/marketing/campaign-outcomes`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-marketing-token': token },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+      body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs),
     });
     const d: any = await r.json().catch(() => null);
     return r.ok && d?.found ? d : null;
