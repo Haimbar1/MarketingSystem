@@ -394,7 +394,9 @@ const periodOf = (days: number) => { const until = israelToday(); return { key: 
 // one call to the CRM for the asked periods; campaign = null → the bottom line of every campaign
 async function crmNumbers(campaign: { id: string; name: string } | null, days: number[]) {
   const periods = days.map(periodOf);
-  const r = await crmOutcomes({ campaignId: campaign?.id || '0', campaignName: campaign?.name || '', adsets: [], ads: [], periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })) });
+  // the CRM requires a campaign id + name (its own row); for "all campaigns" only its bottom line (`total`) is read,
+  // which doesn't depend on them - a placeholder (an empty name was refused with 400 → "couldn't read the CRM")
+  const r = await crmOutcomes({ campaignId: campaign?.id || '0', campaignName: campaign?.name || campaign?.id || 'כל הקמפיינים', adsets: [], ads: [], periods: periods.map(p => ({ key: p.key, since: p.since, until: p.until })) });
   if (!r?.periods) return null;
   return periods.map(p => {
     const x: any = r.periods.find((y: any) => y.key === p.key) || {};
